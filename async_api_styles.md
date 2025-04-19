@@ -102,6 +102,85 @@ for our needs.
 
 # cmake with libcurl vcpkg setup
 
+Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/00_cmake_libcurl/main.cc),
+[CMakeLists.txt](https://github.com/grishavanika/async_api_styles/blob/main/00_cmake_libcurl/CMakeLists.txt).
+
+For [vcpkg](https://github.com/microsoft/vcpkg), there is extensive
+[documentation](https://learn.microsoft.com/en-us/vcpkg/get_started/get-started)
+available. In short:
+
+``` {.numberLines}
+git clone https://github.com/microsoft/vcpkg
+cd vcpkg
+bootstrap-vcpkg.bat
+:: for a later use
+set VCPKG_ROOT=<FULL_PATH_TO_CURRENT_vcpkg>
+:: to make `vcpkg` available
+set path=%VCPKG_ROOT%;%PATH%
+```
+
+For the project, vcpkg [manifest mode](https://learn.microsoft.com/vcpkg/consume/manifest-mode)
+is used. Together with `curl` setup, all required steps are:
+
+``` {.numberLines}
+cd async_api_styles
+vcpkg new --application
+vcpkg add port curl
+```
+
+Note: to find exact `curl` package name, `vcpkg search curl` was used which
+prints:
+
+> curl    8.13.0#1    A library for transferring data with URLs
+
+[CMakeLists.txt](https://github.com/grishavanika/async_api_styles/blob/main/00_cmake_libcurl/CMakeLists.txt)
+now looks like this:
+
+``` cmake {.numberLines}
+cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
+project(async_api_styles LANGUAGES CXX)
+
+add_executable(00_cmake_libcurl main.cc)
+find_package(CURL REQUIRED)
+target_link_libraries(00_cmake_libcurl PRIVATE CURL::libcurl)
+```
+
+`find_package(CURL REQUIRED)` syntax together with `CURL::libcurl`
+target name is found from the output log of `vcpkg install curl` which prints:
+
+``` {.numberLines}
+curl is compatible with built-in CMake targets:
+
+    find_package(CURL REQUIRED)
+    target_link_libraries(main PRIVATE CURL::libcurl)
+```
+
+To test that everything compiles and links, save [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/00_cmake_libcurl/main.cc):
+
+``` cpp {.numberLines}
+#include <curl/curl.h>
+
+int main()
+{
+    CURL* curl = curl_easy_init();
+    assert(curl);
+    curl_easy_cleanup(curl);
+}
+```
+
+Finally, to invoke CMake/build and run (with vcpkg):
+
+``` {.numberLines}
+cd async_api_styles
+cmake -S . -B build ^
+  -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
+cmake --build build --config Debug
+:: run test
+./build/Debug/00_cmake_libcurl.exe
+```
+
+see [build.cmd](https://github.com/grishavanika/async_api_styles/blob/main/build.cmd).
+
 # libcurl, blocking API with easy interface
 # libcurl, asynchronous API with multi interface
 

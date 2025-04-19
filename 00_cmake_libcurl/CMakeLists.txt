@@ -1,4 +1,7 @@
-add_executable(00_cmake_libcurl main_00_cmake_libcurl.cc)
+cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
+project(async_api_styles LANGUAGES CXX)
+
+add_executable(00_cmake_libcurl main.cc)
 
 set_property(TARGET 00_cmake_libcurl
   PROPERTY COMPILE_WARNING_AS_ERROR ON)
