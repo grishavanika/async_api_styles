@@ -22,17 +22,24 @@ std::string CURL_get(const std::string& url)
 {
     CURL* curl = curl_easy_init();
     assert(curl);
-    assert(CURLE_OK == curl_easy_setopt(curl, CURLOPT_URL, url.c_str()));
-    assert(CURLE_OK == curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L));
+
+    CURLcode status = curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    assert(status == CURLE_OK);
+    status = curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    assert(status == CURLE_OK);
     
     std::string response;
-    assert(CURLE_OK == curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CURL_OnWriteCallback));
-    assert(CURLE_OK == curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response));
+    status = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CURL_OnWriteCallback);
+    assert(status == CURLE_OK);
+    status = curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    assert(status == CURLE_OK);
 
-    assert(CURLE_OK == curl_easy_perform(curl));
+    status = curl_easy_perform(curl);
+    assert(status == CURLE_OK);
 
     long response_code = -1;
-    assert(CURLE_OK == curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code));
+    status = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
+    assert(status == CURLE_OK);
     assert(response_code == 200L);
 
     curl_easy_cleanup(curl);
