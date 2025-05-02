@@ -16,7 +16,7 @@ include-before: |
 
 --------------------------------------------------------------------------------
 
-# introduction
+# introduction {#intro}
 
 Lets begin with simple C-style API on top of [libcurl C API](https://curl.se/libcurl/c/)
 and build a program that may look like this:
@@ -103,9 +103,9 @@ for our needs.
 
 --------------------------------------------------------------------------------
 
-# wrapping libcurl
+# wrapping libcurl {#wrap_libcurl}
 
-## cmake with libcurl and vcpkg setup
+## cmake with libcurl and vcpkg setup {#cmake}
 
 Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/00_cmake_libcurl/main.cc),
 [CMakeLists.txt](https://github.com/grishavanika/async_api_styles/blob/main/00_cmake_libcurl/CMakeLists.txt).
@@ -188,7 +188,7 @@ cmake --build build --config Debug
 
 see [build.cmd](https://github.com/grishavanika/async_api_styles/blob/main/build.cmd).
 
-## libcurl, blocking API with easy interface
+## libcurl, blocking API with easy interface {#libcurl_easy}
 
 Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/01_libcurl_blocking_easy/main.cc).
 
@@ -204,7 +204,8 @@ Our function should look like this:
 std::string CURL_get(const std::string& url);
 ```
 
-which is translated to the next implementation:
+which is translated to the implementation below, where `curl_easy_perform()`
+call is the main one that blocks the execution until request complete:
 
 ``` cpp {.numberLines}
 #include <string>
@@ -245,11 +246,11 @@ std::string CURL_get(const std::string& url)
 }
 ```
 
-where `curl_easy_perform()` blocks the execution until request complete.
-
 Note on error handling: for now, we crash on any unexpected error - as in
 "crash the whole application". In the [sample project](https://github.com/grishavanika/async_api_styles/blob/e8ed87380d0d739665b1e95570bdffa8de093c54/00_cmake_libcurl/main.cc#L3-L6),
-`assert()` is enabled always **intentionally**:
+`assert()` is enabled always **intentionally** to simplify both, the sample
+code **and** debugging. Be sure to have it, since otherwise all `assert()` lines
+are no-op in Release configurations:
 
 ``` cpp {.numberLines}
 // after all includes, main.cc
@@ -260,7 +261,7 @@ Note on error handling: for now, we crash on any unexpected error - as in
 ```
 
 This is "bad" for generic, low-level library API/code, but could be
-fine sometimes. We'll discuss error handling later.
+fine sometimes. We'll [discuss error handling later](#error_handling).
 
 To see the code in action, lets run our program:
 
@@ -275,7 +276,7 @@ int main()
 ```
 
 that.. should crash since we don't have local HTTP server running to serve
-`localhost:5001/file1.txt`. See the next section on how to make it happen.
+`localhost:5001/file1.txt`. See the [next section on how to make it happen](#serve).
 
 Once done, we should see the sample [file1.txt](https://github.com/grishavanika/async_api_styles/blob/main/01_libcurl_blocking_easy/file1.txt)
 content in the console output:
@@ -285,13 +286,25 @@ CURL_get(file1.txt): 'content 1'
 
 ```
 
-## python, run simple http server for tests
+## python, run simple http server for tests {#serve}
 
-# libcurl, asynchronous API with multi interface
+To run sample code, lets use Python to have simple HTTP server that hosts
+files in the current directory, see [serve.cmd](https://github.com/grishavanika/async_api_styles/blob/main/01_libcurl_blocking_easy/serve.cmd):
+
+``` bash {.numberLines}
+python -m http.server 5001
+```
+
+Given the directory that has [file1.txt](https://github.com/grishavanika/async_api_styles/blob/main/01_libcurl_blocking_easy/file1.txt)
+and [file2.txt](https://github.com/grishavanika/async_api_styles/blob/main/01_libcurl_blocking_easy/file2.txt),
+`CURL_get("localhost:5001/file1.txt")` and `CURL_get("localhost:5001/file2.txt")`
+should work and return the content of the files, see [blocking libcurl section](#libcurl_easy).
+
+## libcurl, asynchronous API with multi interface {#libcurl_multi}
 
 # blocking, synchronous (App_Blocking) {#sync}
 
-## on error handling
+## on error handling {#error_handling}
 
 ### assume success always (tooling) {.unnumbered .unlisted}
 ### implicit, return empty string {.unnumbered .unlisted}
