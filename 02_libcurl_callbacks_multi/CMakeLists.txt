@@ -11,7 +11,7 @@ set_property(TARGET 02_libcurl_callbacks_multi
 
 target_compile_options(02_libcurl_callbacks_multi PRIVATE
   $<$<CXX_COMPILER_ID:MSVC>:/W4>
-  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>
+  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic -Wno-c++98-compat>
   )
 
 find_package(CURL REQUIRED)

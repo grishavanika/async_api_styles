@@ -36,13 +36,14 @@ struct CURL_AsyncScheduler
     // no copy, no move
     CURL_AsyncScheduler(const CURL_AsyncScheduler&) = delete;
 
+    using Callback = std::function<void (CURL* curl_easy)>;
+
     void tick();
-    void add_request(CURL* curl_easy
-        , std::function<void (CURL* curl_easy)> on_finish);
+    void add_request(CURL* curl_easy, Callback on_finish);
 
     // our state
     CURLM* _multi_curl = nullptr;
-    std::unordered_map<CURL*, std::function<void (CURL* curl_easy)>> _curl_to_callback;
+    std::unordered_map<CURL*, Callback> _curl_to_callback;
 };
 
 CURL_AsyncScheduler::CURL_AsyncScheduler()
@@ -78,15 +79,14 @@ void CURL_AsyncScheduler::tick()
         assert(status == CURLM_OK);
         auto it = _curl_to_callback.find(curl_easy);
         assert(it != _curl_to_callback.end());
-        std::function<void (CURL* curl)> callback = std::move(it->second);
+        Callback callback = std::move(it->second);
         assert(callback);
         (void)_curl_to_callback.erase(it);
         callback(curl_easy);
     }
 }
 
-void CURL_AsyncScheduler::add_request(CURL* curl_easy
-    , std::function<void (CURL* curl_easy)> on_finish)
+void CURL_AsyncScheduler::add_request(CURL* curl_easy, Callback on_finish)
 {
     assert(on_finish);
     assert(curl_easy);
@@ -110,7 +110,7 @@ void CURL_async_destroy(CURL_Async curl_async)
     delete scheduler;
 }
 
-CURL_AsyncScheduler& CURL_scheduler(CURL_Async curl_async)
+static CURL_AsyncScheduler& CURL_scheduler(CURL_Async curl_async)
 {
     CURL_AsyncScheduler* scheduler = static_cast<CURL_AsyncScheduler*>(curl_async);
     assert(scheduler);
@@ -144,13 +144,13 @@ void CURL_async_get(CURL_Async curl_async
 
     // 3. associate with multi handle/event loop
     CURL_scheduler(curl_async).add_request(curl_easy
-        , [state, user_data, callback](CURL* curl_easy)
+        , [state, user_data, callback](CURL* curl_easy_)
     {
         long response_code = -1;
-        const CURLcode status = curl_easy_getinfo(curl_easy, CURLINFO_RESPONSE_CODE, &response_code);
-        assert(status == CURLE_OK);
+        const CURLcode status_ = curl_easy_getinfo(curl_easy_, CURLINFO_RESPONSE_CODE, &response_code);
+        assert(status_ == CURLE_OK);
         assert(response_code == 200L);
-        curl_easy_cleanup(curl_easy);
+        curl_easy_cleanup(curl_easy_);
         std::string data = std::move(*state);
         delete state;
         callback(user_data, std::move(data));
@@ -169,9 +169,9 @@ int main()
     CURL_async_get(curl_async, "localhost:5001/file1.txt", &state
         , [](void* user_data, std::string response)
     {
-        State& state = *static_cast<State*>(user_data);
-        state.response = std::move(response);
-        state.done = true;
+        State& state_ = *static_cast<State*>(user_data);
+        state_.response = std::move(response);
+        state_.done = true;
     });
     while (!state.done)
     {

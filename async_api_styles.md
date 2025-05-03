@@ -433,8 +433,20 @@ callbacks-based APIs.
 
 Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/02_libcurl_callbacks_multi/main.cc).
 
-To implement [C-style callback API above](#libcurl_multi_design), internally,
-lets have `CURL_AsyncScheduler` class to handle adding requests,
+For implementation of [the API](#libcurl_multi_design):
+
+``` cpp {.numberLines}
+using CURL_Async = void*;
+CURL_Async CURL_async_create();
+void CURL_async_destroy(CURL_Async curl_async);
+void CURL_async_tick(CURL_Async curl_async);
+void CURL_async_get(CURL_Async curl_async
+    , const std::string& url
+    , void* user_data
+    , void (*callback)(void* user_data, std::string response));
+```
+
+internally, lets have `CURL_AsyncScheduler` class to handle adding requests,
 updating/ticking libcurl event loop and, in general, to represent
 our whole `CURL_Async` system state:
 
@@ -446,13 +458,14 @@ struct CURL_AsyncScheduler
     // no copy, no move
     CURL_AsyncScheduler(const CURL_AsyncScheduler&) = delete;
 
+    using Callback = std::function<void (CURL* curl_easy)>;
+
     void tick();
-    void add_request(CURL* curl_easy
-        , std::function<void (CURL* curl_easy)> on_finish);
+    void add_request(CURL* curl_easy, Callback on_finish);
 
     // our state
     CURLM* _multi_curl = nullptr;
-    std::unordered_map<CURL*, std::function<void (CURL* curl_easy)>> _curl_to_callback;
+    std::unordered_map<CURL*, Callback> _curl_to_callback;
 };
 ```
 
@@ -557,8 +570,7 @@ CURL_AsyncScheduler::~CURL_AsyncScheduler()
     curl_global_cleanup();
 }
 
-void CURL_AsyncScheduler::add_request(CURL* curl_easy
-    , std::function<void (CURL* curl_easy)> on_finish)
+void CURL_AsyncScheduler::add_request(CURL* curl_easy, Callback on_finish)
 {
     assert(on_finish);
     assert(curl_easy);
@@ -599,7 +611,7 @@ void CURL_AsyncScheduler::tick()
         assert(status == CURLM_OK);
         auto it = _curl_to_callback.find(curl_easy);
         assert(it != _curl_to_callback.end());
-        std::function<void (CURL* curl)> callback = std::move(it->second);
+        Callback callback = std::move(it->second);
         assert(callback);
         (void)_curl_to_callback.erase(it);
         callback(curl_easy);
@@ -673,7 +685,407 @@ async response: 'content 1'
 # async, callbacks (App_Callbacks)
 # async, callbacks + polling (tasks, handle)
 # async with statefull/implicit callback (state.on_X.subscribe/delegates)
-# coroutines on top of callbacks (App_Coro)
+
+# C++20 coroutines on top of callback-based API
+
+There are several moving and a bit unrelative parts to have working coroutines
+code. First, coroutine function return type needs to be built, just to be able
+to write any/empty coroutine:
+
+``` cpp {.numberLines}
+Co_Task coro_work()
+{
+    co_return;
+}
+```
+
+Next, there is a need to write coroutine awaitable to be able to `co_await` some
+work, specifically, GET request:
+
+``` cpp {.numberLines}
+Co_Task coro_work(CURL_Async curl_async)
+{
+    std::string response = co_await CURL_await_get(curl_async, "localhost:5001/file1.txt");
+    co_return;
+}
+```
+
+And, finally, there are some challenges to have a code that has several GET
+requests on the fly with coroutines.
+
+Lets start with basics.
+
+## C++ coroutines, basic task type
+
+Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/0x_cpp_coro_task/main.cc).
+
+There is a trick of writing some basic C++20 coroutines code - **listen to
+compiler**. Lets see what it takes to make the next code "work":
+
+``` cpp {.numberLines}
+Co_Task coro_work()
+{
+    co_return;
+}
+```
+
+`Co_Task` is a class, lets have empty one and try to compile:
+
+``` cpp {.numberLines}
+struct Co_Task {};
+
+Co_Task coro_work()
+{
+    co_return;
+}
+```
+
+MSVC complains:
+
+```
+main.cc(164,5): error C3774: cannot find 'std::coroutine_traits':
+                Please include <coroutine> header
+```
+
+after including `<coroutine>` header:
+
+```
+main.cc(166,5): error C2039: 'promise_type': is not a member of
+                             'std::coroutine_traits<Co_Task>'
+```
+
+Lets add empty `promise_type` class inside `Co_Task`:
+
+``` cpp {.numberLines}
+#include <coroutine>
+
+struct Co_Task
+{
+    struct promise_type {};
+};
+
+Co_Task coro_work()
+{
+    co_return;
+}
+```
+
+MSVC complains:
+
+```
+main.cc(170,1): error C3789: this function cannot be a coroutine:
+    'Co_Task::promise_type' does not declare the member 'get_return_object()'
+main.cc(170,1): error C3789: this function cannot be a coroutine:
+    'Co_Task::promise_type' does not declare the member 'initial_suspend()'
+main.cc(170,1): error C3789: this function cannot be a coroutine:
+    'Co_Task::promise_type' does not declare the member 'final_suspend()'
+```
+
+Ah, so `promise_type` should have `get_return_object()`, `initial_suspend()`
+and `final_suspend()` member functions. Return types are unclear, unfortunately.
+To speed-up things, we know that `get_return_object()` should return `Co_Task`.
+For `initial_suspend()` and `final_suspend()` we'll go with
+`std::suspend_always` awaitables for now. That gives:
+
+``` cpp {.numberLines}
+#include <coroutine>
+
+struct Co_Task
+{
+    struct promise_type
+    {
+        Co_Task get_return_object()           { return {}; }
+        std::suspend_always initial_suspend() { return {}; }
+        std::suspend_always final_suspend()   { return {}; }
+    };
+};
+
+Co_Task coro_work()
+{
+    co_return;
+}
+```
+
+MSVC complains:
+
+```
+main.cc(164,12): error C3781: Co_Task::promise_type:
+    a coroutine's promise must declare either 'return_value' or 'return_void'
+main.cc(176,1): error C2039: 'unhandled_exception': is not a member
+    of 'Co_Task::promise_type'
+```
+
+Since our `coro_work()` coroutine has just `co_return`, we should provide
+`return_void()` member function. With `unhandled_exception()`, we have:
+
+``` cpp {.numberLines}
+struct promise_type
+{
+    Co_Task get_return_object()           { return {}; }
+    std::suspend_always initial_suspend() { return {}; }
+    std::suspend_always final_suspend()   { return {}; }
+    void return_void()                    {}
+    void unhandled_exception()            {}
+};
+```
+
+MSVC complains:
+
+```
+main.cc(168,29): error C5231: the expression
+    'co_await promise.final_suspend()' must be non-throwing
+```
+
+Ok, makes sense. Finally,
+
+``` cpp {.numberLines}
+#include <coroutine>
+
+struct Co_Task
+{
+    struct promise_type
+    {
+        Co_Task get_return_object()                  { return {}; }
+        std::suspend_always initial_suspend()        { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void return_void()                           {}
+        void unhandled_exception()                   {}
+    };
+};
+
+Co_Task coro_work()
+{
+    co_return;
+}
+```
+
+compiles! We just need to fill in details and implement given functions
+properly.
+
+There are way too many different ways to implement coroutine task/promise types.
+There are no constraints and, in general, it all depends on your design and
+needs. We'll go with simplest working one for now:
+
+ 1. `Co_Task` will own coroutine handle (as in free coroutine in the
+    destructor).
+ 2. Because of the above, `final_suspend()` must suspend always.
+ 3. Co_Task will be a "lazy" coroutine, meaning, it's going to be suspended
+    after initial call of `coro_work()`/coroutine function.
+ 4. Because of the above, `initial_suspend()` must suspend.
+ 5. Because coroutine is suspended initially, `Co_Task` needs to expose
+    `resume()` or similar function to run coroutine.
+
+For now, lets proceed with implementation. Since we own coroutine, our 
+`Co_Task` needs to have destructor, should be move-only:
+
+``` cpp {.numberLines}
+struct Co_Task
+{
+    struct promise_type;
+    using co_handle = std::coroutine_handle<promise_type>;
+
+    struct promise_type
+    {
+        Co_Task get_return_object()
+        {
+            return Co_Task{co_handle::from_promise(*this)};
+        }
+        // ...
+    };
+
+    Co_Task(co_handle coro)
+        : _coro{coro} {}
+    Co_Task(Co_Task&& rhs) noexcept
+        : _coro{std::exchange(rhs._coro, {})} { }
+    Co_Task(const Co_Task&) = delete;
+    ~Co_Task() noexcept
+    {
+        if (_coro)
+        {
+            _coro.destroy();
+        }
+    }
+
+    co_handle _coro;
+};
+```
+
+In short, when we call `coro_work()`, compiler creates `Co_Task::promise_type`
+and invokes `get_return_object()` to be able to return an instance of `Co_Task`
+to the user. Here, in `get_return_object()` there is a way to get an access
+to `std::coroutine_handle<>` - the only way to interact with just alocated
+coroutine. Once `Co_Task` is created, we return it to the user.
+It's **up to the user** to manage `Co_Task`. In our case, we own just created
+coroutine, hence if `Co_Task` is destroyed, we assume coroutine is in suspended
+state and destroy it too.
+
+Writing down the rest of functions:
+
+``` cpp {.numberLines}
+std::suspend_always initial_suspend()
+{
+    return {};
+}
+
+std::suspend_always final_suspend() noexcept
+{
+    return {};
+}
+
+void return_void()
+{
+    // yeah, we return void. Nothing to do
+}
+
+void unhandled_exception()
+{
+    // crash, no exceptions handling
+    assert(false);
+}
+```
+
+we can test the basics:
+
+``` cpp {.numberLines}
+Co_Task coro_work()
+{
+    std::println("inside coro_work");
+    co_return;
+}
+
+int main()
+{
+    Co_Task coro = coro_work(); 
+}
+```
+
+which runs and... prints nothing since our coroutine is created and immediately
+suspended even before executing first print.
+
+Lets expose `resume()` for our `Co_Task` and use it:
+
+``` cpp {.numberLines}
+void Co_Task::resume()
+{
+    assert(_coro);
+    assert(!_coro.done());
+    _coro.resume();
+}
+
+Co_Task coro_work()
+{
+    std::println("inside coro_work");
+    co_return;
+}
+
+int main()
+{
+    std::println("-- before coro_work()");
+    Co_Task coro = coro_work();
+    std::println("-- after coro_work()");
+    coro.resume();
+    std::println("-- after resume()");
+}
+```
+
+which prints:
+
+```
+-- before coro_work()
+-- after coro_work()
+inside coro_work
+-- after resume()
+```
+
+## C++ coroutines, simple await
+
+Given that we can have simplest coroutine, what does it take to co_await?
+Lets try to compile:
+
+```
+struct Co_CurlAsync {};
+
+Co_Task coro_work()
+{
+    co_await Co_CurlAsync{};
+    co_return;
+}
+```
+
+MSVC complains:
+
+```
+main.cc(73,26): error C2039: 'await_ready': is not a member of 'Co_CurlAsync'
+main.cc(73,26): error C2039: 'await_suspend': is not a member of 'Co_CurlAsync'
+main.cc(70,26): error C2039: 'await_resume': is not a member of 'Co_CurlAsync'
+```
+
+So `co_await` requires "awaiter" to have those 3 functions. We can think about
+awaiter as something that:
+
+ 1. knows if some operation is ready
+ 2. knows how to suspend **and** (optionally) resume coroutine later
+ 3. knows how to get the result of awaited operation
+
+The compiler asks awaiter, specifically, `Co_CurlAsync` with
+`bool await_ready()` if operation is done/ready or is in progress. If awaiter
+returns false, the compiler switches current coroutine state to "suspended"
+and invokes awaiter's `await_suspend(std::coroutine_handle<> coro)`
+customization point which allows to remember current coroutine `coro` handle
+to call `.resume()` later, once operation is done. Once coroutine is resumed,
+compiler asks for a value from last awaiter responsible for suspend.
+
+In short, we can have `Co_CurlAsync` awaiter that tells that (1) operation is
+not ready yet (2) on suspend, resumes coroutine immediately and (3) returns
+nothing:
+
+``` cpp {.numberLines}
+struct Co_CurlAsync
+{
+    bool await_ready()
+    {
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> coro)
+    {
+        std::println("-- inside suspend, resuming immediately");
+        coro.resume();
+    }
+
+    void await_resume()
+    {
+        std::println("-- resume");
+    }
+};
+
+Co_Task coro_work()
+{
+    std::println("before co_await");
+    co_await Co_CurlAsync{};
+    std::println("after co_await");
+    co_return;
+}
+
+int main()
+{
+    Co_Task coro = coro_work();
+    coro.resume();
+}
+```
+
+which prints:
+
+```
+before co_await
+-- inside suspend, resuming immediately
+-- resume
+after co_await
+```
+
+Now, on suspend, we did nothing, but immediately resumed coroutine.
+But we also could start an async operation and, on finish, resume the coroutine.
+
 # coroutines on top polling tasks
 # fibers (WIN32) (App_Fibers)
 # senders
