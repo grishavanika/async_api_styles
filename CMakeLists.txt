@@ -5,3 +5,4 @@ project(async_api_styles LANGUAGES CXX)
 
 add_subdirectory(00_cmake_libcurl)
 add_subdirectory(01_libcurl_blocking_easy)
+add_subdirectory(02_libcurl_callbacks_multi)
