@@ -275,6 +275,20 @@ static Co_Task coro_main(CURL_Async curl_async)
 
 int main()
 {
+#if (0) // set to 1 for a crash
+    CURL_Async curl_async = CURL_async_create();
+
+    {
+        Co_Task task = coro_main(curl_async);
+        task.resume(); // run
+    }   // **destroy**
+
+    while (true)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+#else
     CURL_Async curl_async = CURL_async_create();
     Co_Task task = coro_main(curl_async);
     task.resume();
@@ -283,4 +297,5 @@ int main()
         CURL_async_tick(curl_async);
     }
     CURL_async_destroy(curl_async);
+#endif
 }

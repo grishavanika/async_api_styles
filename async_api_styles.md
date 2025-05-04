@@ -1110,7 +1110,7 @@ after co_await
 Now, on suspend, we did nothing, but immediately resumed coroutine.
 But we also could start an async operation and, on finish, resume the coroutine.
 
-## C++ coroutines, await CURL callback with a crash
+## C++ coroutines, await callback with a crash
 
 Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/0x_cpp_coro_await_curl_crash/main.cc).
 
@@ -1169,7 +1169,7 @@ our CURL awaiter - Co_CurlAsync, we:
 
 **There is one big issue there**: what if we start a request with
 `CURL_async_get()`, coroutine suspends, BUT user discards `Co_Task` value
-that destroys coroutine, making `std::coroutine_handle<>` we remembered
+that destroys coroutine, making `std::coroutine_handle<>` we remembered -
 dangling? There are several possible solutions, but lets see the current code
 in action by writing our main() function:
 
@@ -1213,6 +1213,59 @@ Running the sample should print:
 coro_main response: 'content 1'
 
 ```
+
+However, that works because we wait for coroutine until full complete. If
+we discard Co_Task too early, there is going to be a crash:
+
+``` cpp {.numberLines}
+int main()
+{
+    CURL_Async curl_async = CURL_async_create();
+
+    {
+        Co_Task task = coro_main(curl_async);
+        task.resume(); // run
+    }   // **destroy**
+
+    while (true)
+    {
+        CURL_async_tick(curl_async); // resume coroutine from there
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+It happens because `CURL_async_get()` callback remembers 2 pointers:
+
+ 1. `this` pointer to Co_CurlAsync/awaiter which is owned by coroutine frame
+ 2. and `coroutine_handle<>` itself, which we destroy BEFORE `CURL_async_get()`
+    finish.
+
+In short, we start request, then `.destroy()` coroutine then try
+to resume dangling coroutine inside a callback with a call to `.resume()`
+even using stale pointer to awaiter (user data in the callback).
+
+There are several solutions, few of them:
+
+ 1. Don't own and don't destroy coroutine inside Co_Task destructor,
+    mark final_suspend() as suspend_never which will automatically clean-up
+    coroutine on final co_return.
+ 2. Delay coroutine destroy if there are live references to it.
+ 3. Be able to cancel `CURL_async_get()` request iff coroutine/awaiter
+    is destroyed.
+ 4. Ensure that callback has a safe way to detect dead coroutine and do nothing.
+
+1st solution could be the best but changes completely the semantics of
+`Co_Task`, does not allow to easily have `Co_Task<T>` that return some value
+and requires to be able to change `Co_Task` internals.
+
+2nd solution is similar in the sense that it also requires `Co_Task` changes.
+
+3rd solution requires changes to our basic C-style callback API which we assume
+we can't do.
+
+4th solution is the most ineficient and requires no changes neither in Co_Task
+nor in callback API.
 
 # coroutines on top polling tasks
 # fibers (WIN32) (App_Fibers)
