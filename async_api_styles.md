@@ -319,7 +319,8 @@ and the response should arrive some time later. The system invokes a
 user-provided `callback` to notify us once everything is done:
 
 ``` cpp {.numberLines}
-void CURL_async_get(const std::string& url, void (*callback)(std::string));
+void CURL_async_get(const std::string& url
+    , void (*callback)(std::string));
 ```
 
 we could use it like this:
@@ -695,6 +696,14 @@ Coroutines materials:
  - All of [Asymmetric Transfer](https://lewissbaker.github.io/),
    author of [cppcoro](https://github.com/lewissbaker/cppcoro).
 
+In short, we'd like to have somehow to be able to write something like this:
+
+``` cpp {.numberLines}
+const std::string response = co_await CURL_await_get(
+    curl_async, "localhost:5001/file1.txt");
+// use `response` as a usual variable, no callbacks
+```
+
 There are several moving and a bit unrelative parts to have working coroutines
 code. First, coroutine function return type needs to be built, just to be able
 to write any/empty coroutine:
@@ -712,7 +721,8 @@ work, specifically, GET request:
 ``` cpp {.numberLines}
 Co_Task coro_work(CURL_Async curl_async)
 {
-    std::string response = co_await CURL_await_get(curl_async, "localhost:5001/file1.txt");
+    std::string response = co_await CURL_await_get(curl_async
+        , "localhost:5001/file1.txt");
     co_return;
 }
 ```
@@ -875,7 +885,7 @@ properly.
 
 There are way too many different ways to implement coroutine task/promise types.
 There are no constraints and, in general, it all depends on your design and
-needs. We'll go with simplest working one for now:
+needs. We'll go with owning coroutine task type:
 
  1. `Co_Task` will own coroutine handle (as in free coroutine in the
     destructor).
@@ -1010,6 +1020,8 @@ inside coro_work
 
 ## C++ coroutines, basic await
 
+Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/0x_cpp_coro_basic_await/main.cc).
+
 Given that we can have simplest coroutine, what does it take to co_await?
 Lets try to compile:
 
@@ -1034,8 +1046,8 @@ main.cc(70,26): error C2039: 'await_resume': is not a member of 'Co_CurlAsync'
 So `co_await` requires "awaiter" to have those 3 functions. We can think about
 awaiter as something that:
 
- 1. knows if some operation is ready
- 2. knows how to suspend **and** (optionally) resume coroutine later
+ 1. knows if some operation is ready or not
+ 2. knows how to resume coroutine later
  3. knows how to get the result of awaited operation
 
 The compiler asks awaiter, specifically, `Co_CurlAsync` with
@@ -1043,8 +1055,9 @@ The compiler asks awaiter, specifically, `Co_CurlAsync` with
 returns false, the compiler switches current coroutine state to "suspended"
 and invokes awaiter's `await_suspend(std::coroutine_handle<> coro)`
 customization point which allows to remember current coroutine `coro` handle
-to call `.resume()` later, once operation is done. Once coroutine is resumed,
-compiler asks for a value from last awaiter responsible for suspend.
+that goes to suspend state, to call `.resume()` later, once operation is done.
+Once coroutine is resumed, compiler asks for a value from last awaiter
+responsible for suspend.
 
 In short, we can have `Co_CurlAsync` awaiter that tells that (1) operation is
 not ready yet (2) on suspend, resumes coroutine immediately and (3) returns
@@ -1096,6 +1109,110 @@ after co_await
 
 Now, on suspend, we did nothing, but immediately resumed coroutine.
 But we also could start an async operation and, on finish, resume the coroutine.
+
+## C++ coroutines, await CURL callback with a crash
+
+Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/0x_cpp_coro_await_curl_crash/main.cc).
+
+Lets continue implementing `Co_CurlAsync` above, in short:
+
+``` cpp {.numberLines}
+struct Co_CurlAsync
+{
+    CURL_Async _curl_async{};
+    std::string _url;
+    std::coroutine_handle<> _coro;
+    std::string _response;
+
+    bool await_ready()
+    { // 1. CURL_async_get() is not yet started, force coroutine suspend:
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> coro)
+    { // 2. remember coroutine handle, start request, resume on finish:
+        _coro = coro;
+
+        CURL_async_get(_curl_async, _url, this
+            , [](void* user_data, std::string response)
+        {
+            Co_CurlAsync& self = *static_cast<Co_CurlAsync*>(user_data);
+            self._response = std::move(response);
+            self._coro.resume();
+        });
+    }
+
+    std::string await_resume()
+    { // 3. after resume, return response:
+        return std::move(_response);
+    }
+};
+
+Co_CurlAsync CURL_await_get(CURL_Async curl_async, const std::string& url)
+{
+    return Co_CurlAsync{._curl_async = curl_async, ._url = url};
+}
+```
+
+So, now `co_await CURL_await_get(..., "url")` should compile and kind-a work.
+As always, there are few moving part.
+
+When coroutine function (represented as `std::coroutine_handle<>`) `co_await`s
+our CURL awaiter - Co_CurlAsync, we:
+
+1. force whole coroutine to suspend, since we return false from `await_ready()`
+2. this is needed so compiler invokes `await_suspend()` and gives us
+   a handle to currently awaiting coroutine, so we can (a) start
+   request and (b) resume coroutine with a call to `coro.resume()`
+3. finally, once request is complete, we can return the `_response` from
+   `await_resume()`
+
+**There is one big issue there**: what if we start a request with
+`CURL_async_get()`, coroutine suspends, BUT user discards `Co_Task` value
+that destroys coroutine, making `std::coroutine_handle<>` we remembered
+dangling? There are several possible solutions, but lets see the current code
+in action by writing our main() function:
+
+``` cpp {.numberLines}
+Co_Task coro_main(CURL_Async curl_async)
+{
+    const std::string response = co_await CURL_await_get(
+        curl_async, "localhost:5001/file1.txt");
+
+    std::println("coro_main response: '{}'", response);
+    co_return;
+}
+
+int main()
+{
+    CURL_Async curl_async = CURL_async_create();
+    Co_Task task = coro_main(curl_async);
+    task.resume();
+    while (task.is_in_progress())
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+Here, we setup `CURL_Async`, as usual, and drive the loop until coroutine is
+in progress:
+
+``` cpp {.numberLines}
+bool Co_Task::is_in_progress() const
+{
+    assert(_coro);
+    return !_coro.done();
+}
+```
+
+Running the sample should print:
+
+```
+coro_main response: 'content 1'
+
+```
 
 # coroutines on top polling tasks
 # fibers (WIN32) (App_Fibers)
