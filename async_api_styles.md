@@ -12,6 +12,9 @@ include-before: |
 
     Jump to [tasks](#tasks), [std::future](#future),
     [coroutines](#coroutines), [fibers](#fibers), [senders](#senders).
+
+    [Work In Progress]{.mark}.
+
 ---
 
 --------------------------------------------------------------------------------
@@ -103,9 +106,7 @@ for our needs.
 
 --------------------------------------------------------------------------------
 
-# wrapping libcurl {#wrap_libcurl}
-
-## cmake with libcurl and vcpkg setup {#cmake}
+# setup with cmake + libcurl {#cmake}
 
 Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/00_cmake_libcurl/main.cc),
 [CMakeLists.txt](https://github.com/grishavanika/async_api_styles/blob/main/00_cmake_libcurl/CMakeLists.txt).
@@ -188,12 +189,12 @@ cmake --build build --config Debug
 
 see [build.cmd](https://github.com/grishavanika/async_api_styles/blob/main/build.cmd).
 
-## libcurl, blocking API with easy interface {#libcurl_easy}
+# building blocking API {#libcurl_easy}
 
 Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/01_libcurl_blocking_easy/main.cc).
 
 Our blocking, synchronous API for GET request is straightforward,
-lets go with functin that looks like this:
+lets go with function that looks like this:
 
 ``` cpp {.numberLines}
 std::string CURL_get(const std::string& url);
@@ -292,7 +293,7 @@ CURL_get(file1.txt): 'content 1'
 
 ```
 
-## python, run simple http server for tests {#serve}
+## run simple http server for tests {#serve}
 
 To run sample code, lets use Python to have simple HTTP server that hosts
 files in the current directory, see [serve.cmd](https://github.com/grishavanika/async_api_styles/blob/main/01_libcurl_blocking_easy/serve.cmd):
@@ -306,11 +307,11 @@ and [file2.txt](https://github.com/grishavanika/async_api_styles/blob/main/01_li
 `CURL_get("localhost:5001/file1.txt")` and `CURL_get("localhost:5001/file2.txt")`
 should work and return the content of the files, see [blocking libcurl section](#libcurl_easy).
 
-## libcurl, asynchronous API with multi interface {#libcurl_multi}
+# building classic C-style callbacks API {#libcurl_multi}
 
 Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/02_libcurl_callbacks_multi/main.cc).
 
-### thoughts on the design {#libcurl_multi_design}
+## thoughts on the design {#libcurl_multi_design}
 
 Now, lets imagine simplest possible asynchronous API. The difference to
 [blocking API](#libcurl_easy) is that we ask the system to start a GET request
@@ -398,7 +399,7 @@ void CURL_async_get(CURL_Async curl_async
     , void (*callback)(void* user_data, std::string response));
 ```
 
-### note on C-style API {#libcurl_c_style}
+## note on C-style API (vs C++) {#libcurl_c_style}
 
 For [C-style API above](#libcurl_multi_design), with C++, "the system"
 could be a class, callback could be `std::function<>` to accept anything,
@@ -429,7 +430,7 @@ The rest of asynchronous APIs implementations below are built on top of
 C-style callback API, as a basic building block to cover similar
 callbacks-based APIs.
 
-### implementing libcurl callback-based API {#libcurl_multi_impl}
+## implementing with libcurl multi {#libcurl_multi_impl}
 
 Source code: [main.cc](https://github.com/grishavanika/async_api_styles/blob/main/02_libcurl_callbacks_multi/main.cc).
 
@@ -686,7 +687,13 @@ async response: 'content 1'
 # async, callbacks + polling (tasks, handle)
 # async with statefull/implicit callback (state.on_X.subscribe/delegates)
 
-# C++20 coroutines on top of callback-based API
+# building C++20 coroutines API
+
+Coroutines materials:
+
+ - [How C++ coroutines work](https://kirit.com/How%20C%2B%2B%20coroutines%20work).
+ - All of [Asymmetric Transfer](https://lewissbaker.github.io/),
+   author of [cppcoro](https://github.com/lewissbaker/cppcoro).
 
 There are several moving and a bit unrelative parts to have working coroutines
 code. First, coroutine function return type needs to be built, just to be able
@@ -751,7 +758,7 @@ after including `<coroutine>` header:
 
 ```
 main.cc(166,5): error C2039: 'promise_type': is not a member of
-                             'std::coroutine_traits<Co_Task>'
+                'std::coroutine_traits<Co_Task>'
 ```
 
 Lets add empty `promise_type` class inside `Co_Task`:
@@ -774,11 +781,14 @@ MSVC complains:
 
 ```
 main.cc(170,1): error C3789: this function cannot be a coroutine:
-    'Co_Task::promise_type' does not declare the member 'get_return_object()'
+                'Co_Task::promise_type' does not declare the member
+                'get_return_object()'
 main.cc(170,1): error C3789: this function cannot be a coroutine:
-    'Co_Task::promise_type' does not declare the member 'initial_suspend()'
+                'Co_Task::promise_type' does not declare the member
+                'initial_suspend()'
 main.cc(170,1): error C3789: this function cannot be a coroutine:
-    'Co_Task::promise_type' does not declare the member 'final_suspend()'
+                'Co_Task::promise_type' does not declare the member
+                'final_suspend()'
 ```
 
 Ah, so `promise_type` should have `get_return_object()`, `initial_suspend()`
@@ -809,10 +819,11 @@ Co_Task coro_work()
 MSVC complains:
 
 ```
-main.cc(164,12): error C3781: Co_Task::promise_type:
-    a coroutine's promise must declare either 'return_value' or 'return_void'
+main.cc(164,12): error C3781: Co_Task::promise_type: a coroutine's
+                 promise must declare either
+                 'return_value' or 'return_void'
 main.cc(176,1): error C2039: 'unhandled_exception': is not a member
-    of 'Co_Task::promise_type'
+                of 'Co_Task::promise_type'
 ```
 
 Since our `coro_work()` coroutine has just `co_return`, we should provide
@@ -833,7 +844,7 @@ MSVC complains:
 
 ```
 main.cc(168,29): error C5231: the expression
-    'co_await promise.final_suspend()' must be non-throwing
+                 'co_await promise.final_suspend()' must be non-throwing
 ```
 
 Ok, makes sense. Finally,
@@ -922,22 +933,22 @@ state and destroy it too.
 Writing down the rest of functions:
 
 ``` cpp {.numberLines}
-std::suspend_always initial_suspend()
+std::suspend_always promise_type::initial_suspend()
 {
     return {};
 }
 
-std::suspend_always final_suspend() noexcept
+std::suspend_always promise_type::final_suspend() noexcept
 {
     return {};
 }
 
-void return_void()
+void promise_type::return_void()
 {
     // yeah, we return void. Nothing to do
 }
 
-void unhandled_exception()
+void promise_type::unhandled_exception()
 {
     // crash, no exceptions handling
     assert(false);
@@ -997,12 +1008,12 @@ inside coro_work
 -- after resume()
 ```
 
-## C++ coroutines, simple await
+## C++ coroutines, basic await
 
 Given that we can have simplest coroutine, what does it take to co_await?
 Lets try to compile:
 
-```
+``` cpp {.numberLines}
 struct Co_CurlAsync {};
 
 Co_Task coro_work()
