@@ -748,7 +748,7 @@ Lets start with basics.
 
 CODE: CH0x_coro_task
 
-There is a trick of writing some basic C++20 coroutines code - **listen to
+There is a trick to writing some basic C++20 coroutines code - **listen to
 compiler**. Lets see what it takes to make the next code "work":
 
 ``` cpp {.numberLines}
@@ -897,7 +897,7 @@ properly.
 
 There are way too many different ways to implement coroutine task/promise types.
 There are no constraints and, in general, it all depends on your design and
-needs. We'll go with owning coroutine task type:
+needs. We'll go with an owning coroutine task type:
 
  1. `Co_Task` will own coroutine handle (as in free coroutine in the
     destructor).
@@ -906,7 +906,7 @@ needs. We'll go with owning coroutine task type:
     after initial call of `coro_work()`/coroutine function.
  4. Because of the above, `initial_suspend()` must suspend.
  5. Because coroutine is suspended initially, `Co_Task` needs to expose
-    `resume()` or similar function to run coroutine.
+    `resume()` or similar function to run a coroutine.
 
 For now, lets proceed with implementation. Since we own coroutine, our 
 `Co_Task` needs to have destructor, should be move-only:
@@ -948,7 +948,7 @@ and invokes `get_return_object()` to be able to return an instance of `Co_Task`
 to the user. Here, in `get_return_object()` there is a way to get an access
 to `std::coroutine_handle<>` - the only way to interact with just alocated
 coroutine. Once `Co_Task` is created, we return it to the user.
-It's **up to the user** to manage `Co_Task`. In our case, we own just created
+It's **up to the user** to manage `std::coroutine_handle<>`. In our case, we own just created
 coroutine, hence if `Co_Task` is destroyed, we assume coroutine is in suspended
 state and destroy it too.
 
@@ -1058,16 +1058,16 @@ main.cc(70,26): error C2039: 'await_resume': is not a member of 'Co_CurlAsync'
 So `co_await` requires "awaiter" to have those 3 functions. We can think about
 awaiter as something that:
 
- 1. knows if some operation is ready or not
- 2. knows how to resume coroutine later
- 3. knows how to get the result of awaited operation
+ 1. knows if some operation is ready or not (`..._ready`)
+ 2. knows how to resume coroutine later (`..._suspend`)
+ 3. knows how to get the result of awaited operation (`..._resume`)
 
 The compiler asks awaiter, specifically, `Co_CurlAsync` with
 `bool await_ready()` if operation is done/ready or is in progress. If awaiter
 returns false, the compiler switches current coroutine state to "suspended"
 and invokes awaiter's `await_suspend(std::coroutine_handle<> coro)`
-customization point which allows to remember current coroutine `coro` handle
-that goes to suspend state, to call `.resume()` later, once operation is done.
+customization point which allows to remember currently suspended coroutine `coro` handle,
+to call `.resume()` later, once operation is done.
 Once coroutine is resumed, compiler asks for a value from last awaiter
 responsible for suspend.
 
@@ -1253,17 +1253,16 @@ It happens because `CURL_async_get()` callback remembers 2 pointers:
  2. and `coroutine_handle<>` itself, which we destroy BEFORE `CURL_async_get()`
     finish.
 
-In short, we start request, then `.destroy()` coroutine then try
+In short, we start request, then `.destroy()` coroutine, then try
 to resume dangling coroutine inside a callback with a call to `.resume()`
 even using stale pointer to awaiter (user data in the callback).
 
 There are several solutions, few of them:
 
- 1. Don't own and don't destroy coroutine inside Co_Task destructor,
-    mark final_suspend() as suspend_never which will automatically clean-up
-    coroutine on final co_return.
+ 1. Don't own and don't destroy coroutine inside Co_Task destructor
+    (.. in a multiple ways).
  2. Delay coroutine destroy if there are live references to it.
- 3. Be able to cancel `CURL_async_get()` request iff coroutine/awaiter
+ 3. Be able to cancel `CURL_async_get()` request if coroutine/awaiter
     is destroyed.
  4. Ensure that callback has a safe way to detect dead coroutine and do nothing.
 
@@ -1271,10 +1270,11 @@ There are several solutions, few of them:
 `Co_Task`, does not allow to easily have `Co_Task<T>` that return some value
 and requires to be able to change `Co_Task` internals.
 
-2nd solution is similar in the sense that it also requires `Co_Task` changes.
+2nd solution is similar in the sense that it also requires `Co_Task`
+changes and the code around.
 
 3rd solution requires changes to our basic C-style callback API which we assume
-we can't do.
+we can't do (since, otherwise, the interface is more advanced).
 
 4th solution is the most ineficient and requires no changes neither in Co_Task
 nor in callback API.

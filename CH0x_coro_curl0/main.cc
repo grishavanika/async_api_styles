@@ -141,7 +141,8 @@ void CURL_async_get(CURL_Async curl_async
     assert(status == CURLE_OK);
     
     // 2. write response data to separate std::string
-    std::string* state = new std::string{};
+    std::string* state = new(std::nothrow) std::string{};
+    assert(state);
     status = curl_easy_setopt(curl_easy, CURLOPT_WRITEFUNCTION, CURL_OnWriteCallback);
     assert(status == CURLE_OK);
     status = curl_easy_setopt(curl_easy, CURLOPT_WRITEDATA, state);
