@@ -110,7 +110,6 @@ for our needs.
 
 CODE: CH00_cmake
 
-
 For [vcpkg](https://github.com/microsoft/vcpkg), there is an extensive
 [documentation](https://learn.microsoft.com/en-us/vcpkg/get_started/get-started)
 available. In short:
@@ -1278,6 +1277,131 @@ we can't do (since, otherwise, the interface is more advanced).
 
 4th solution is the most ineficient and requires no changes neither in Co_Task
 nor in callback API.
+
+## C++ coroutines, await callback (no crash)
+
+CODE: CH0x_coro_curl
+
+Lets fix the problematic part in a simple way:
+
+``` cpp {.numberLines}
+// struct Co_CurlAsync ...
+void await_suspend(std::coroutine_handle<> coro)
+{ // 2. remember coroutine handle, start request, resume on finish:
+    _coro = coro;
+
+    CURL_async_get(_curl_async, _url
+        , this // ** HERE
+        , [](void* user_data, std::string response)
+    {
+        Co_CurlAsync& self = *static_cast<Co_CurlAsync*>(user_data);
+        self._response = std::move(response);
+        self._coro.resume();
+    });
+}
+```
+
+For a "happy" path, when `CURL_async_get()` completes before coroutine
+destruction, the flow is:
+
+1) create Co_CurlAsync, invoke CURL_async_get
+2) invoke callback (access this/coroutine)
+3) destroy Co_CurlAsync
+
+For a "bad" path, when coroutine is destroyed while we have CURL_async_get
+in progress, the flow is:
+
+1) create Co_CurlAsync, invoke CURL_async_get
+2) destroy Co_CurlAsync
+3) invoke callback (access this/dead coroutine)
+
+Lets alocate a separate object that can outlive the coroutine/await.
+There is an assumption that `CURL_async_get()` callback is always
+going to be invoked. Given this, we:
+
+A) allocate `WaitState` object - right before CURL_async_get()
+B) pass it to the callback instead of `this`
+C) destroy allocated object inside callback
+
+This way we guarantee that the object is always alive while
+request is in progress and its lifetime is bound the the request
+itself and nothing else:
+
+``` cpp {.numberLines}
+_wait_state = new(std::nothrow) WaitState{._self = this};
+assert(_wait_state);
+
+CURL_async_get(_curl_async, _url
+    , _wait_state
+    , [](void* user_data, std::string response)
+{
+    WaitState* wait_state = static_cast<WaitState*>(user_data);
+    assert(wait_state);
+    if (wait_state->_self)
+    {
+        Co_CurlAsync& self = *wait_state->_self;
+        self._wait_state = nullptr;
+        self._response = std::move(response);
+        self._coro.resume();
+    }
+    // else: Co_CurlAsync/coroutine is dead
+    delete wait_state;
+});
+```
+
+`WaitState` is just a struct that has a reference to `Co_CurlAsync`:
+
+``` cpp {.numberLines}
+struct Co_CurlAsync
+{
+    struct WaitState
+    {
+        Co_CurlAsync* _self = nullptr;
+    };
+    WaitState* _wait_state = nullptr;
+```
+
+When coroutine/Co_CurlAsync is destroyed, we need to mark `WaitState`
+reference to it as null so `CURL_async_get()` knows it's not alive:
+
+``` cpp {.numberLines}
+~Co_CurlAsync()
+{
+    if (_wait_state)
+    { // CURL_async_get() is still in progress
+        assert(_wait_state->_self == this);
+        _wait_state->_self = nullptr; // dead
+    }
+    // else: CURL_async_get() is already completed
+}
+```
+
+That's how you write ineficient coroutine types for a systems
+that know nothing about coroutines. When doing simple call:
+
+``` cpp {.numberLines}
+const std::string response = co_await CURL_await_get(
+    curl_async, "localhost:5001/file1.txt");
+```
+
+we:
+
+ 1. allocate coroutine frame itself
+ 2. CURL_await_get allocates `WaitState`
+ 3. CURL_async_get allocates `std::string` to write a response
+ 4. CURL_async_get allocates `std::function` for a generic callback
+ 5. CURL_async_get allocates `std::unordered_map` node to remember what to call when
+ 6. .. and probably something else (CURL internals, etc)
+
+"simple" CURL_async_get() implementation alone brings 3 allocations.
+"simple" co_await CURL_async_get() brings 2 more separate allocations.
+
+With CURL scheduler that **knows** about coroutines and few more
+optimizations and limitations, this number of allocations can go down to amortized 0:
+
+ * CURL scheduler prealocates up to N max requests
+ * request itself knows how to store the response and coroutine-callback inline
+ * coroutine itself re-uses memory pool for up to N max active coroutines.
 
 # coroutines on top polling tasks
 # fibers (WIN32) (App_Fibers)

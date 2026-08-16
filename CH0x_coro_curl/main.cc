@@ -228,6 +228,11 @@ struct Co_Task
 
 struct Co_CurlAsync
 {
+	struct WaitState
+	{
+        Co_CurlAsync* _self = nullptr;
+	};
+    WaitState* _wait_state = nullptr;
     CURL_Async _curl_async{};
     std::string _url;
     std::coroutine_handle<> _coro;
@@ -241,15 +246,35 @@ struct Co_CurlAsync
     void await_suspend(std::coroutine_handle<> coro)
     { // 2. remember coroutine handle, start request, resume on finish:
         _coro = coro;
+        _wait_state = new(std::nothrow) WaitState{._self = this};
+        assert(_wait_state);
 
         CURL_async_get(_curl_async, _url
-            , this
+            , _wait_state
             , [](void* user_data, std::string response)
         {
-            Co_CurlAsync& self = *static_cast<Co_CurlAsync*>(user_data);
-            self._response = std::move(response);
-            self._coro.resume();
+            WaitState* wait_state = static_cast<WaitState*>(user_data);
+            assert(wait_state);
+            if (wait_state->_self)
+            {
+                Co_CurlAsync& self = *wait_state->_self;
+                self._wait_state = nullptr;
+                self._response = std::move(response);
+                self._coro.resume();
+            }
+            // else: Co_CurlAsync/coroutine is dead
+            delete wait_state;
         });
+    }
+
+    ~Co_CurlAsync()
+    {
+	    if (_wait_state)
+	    { // CURL_async_get() is still in progress
+            assert(_wait_state->_self == this);
+            _wait_state->_self = nullptr; // dead
+	    }
+        // else: CURL_async_get() is already completed
     }
 
     std::string await_resume()
@@ -277,27 +302,18 @@ static Co_Task coro_main(CURL_Async curl_async)
 
 int main()
 {
-#if (0) // set to 1 for a crash
     CURL_Async curl_async = CURL_async_create();
+    Co_Task task = coro_main(curl_async);
+    task.resume();
 
     {
         Co_Task task = coro_main(curl_async);
         task.resume(); // run
-    }   // **destroy**
+    }   // destroy task
 
-    while (true)
-    {
-        CURL_async_tick(curl_async);
-    }
-    CURL_async_destroy(curl_async);
-#else
-    CURL_Async curl_async = CURL_async_create();
-    Co_Task task = coro_main(curl_async);
-    task.resume();
     while (task.is_in_progress())
     {
         CURL_async_tick(curl_async);
     }
     CURL_async_destroy(curl_async);
-#endif
 }
