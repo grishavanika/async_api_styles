@@ -707,7 +707,7 @@ Coroutines materials:
  - All of [Asymmetric Transfer](https://lewissbaker.github.io/),
    author of [cppcoro](https://github.com/lewissbaker/cppcoro).
 
-In short, we'd like to have somehow to be able to write something like this:
+In short, we'd like to be able to write something like this:
 
 ``` cpp {.numberLines}
 const std::string response = co_await CURL_await_get(
@@ -1404,6 +1404,268 @@ optimizations and limitations, this number of allocations can go down to amortiz
  * coroutine itself re-uses memory pool for up to N max active coroutines.
 
 # coroutines on top polling tasks
+
+# building Fibers API
+
+CODE: CH0x_fiber_basic
+
+(Win32) Fibers materials:
+
+ - [Using Fibers](https://learn.microsoft.com/en-us/windows/win32/procthread/using-fibers)
+ - [Fibers: the Most Elegant Windows API](https://nullprogram.com/blog/2019/03/28/)
+
+In short, we'd like to be able to write something like this:
+
+``` cpp {.numberLines}
+const std::string response = FF_await_get(
+    curl_async, "localhost:5001/file1.txt");
+// use `response` as a usual variable, no callbacks
+```
+
+to make an asynchronous request. No callbacks, no special keywords.
+
+While "Using Fibers" example above is nice, it's still overly complicated to get
+basic idea in a simpler form.
+
+Going with Win32 Fibers, short intro is:
+
+ - fibers allow to suspend and resume execution at any given point inside a function
+ - they are stackful coroutines, as opposed to C++20 coroutines that are stackless
+ - they implement symmetric coroutines (same as C++20 coroutines);
+   we'll build asymmetric coroutines on top of Fibers
+ - it should be trivial to ifdef POSIX implementation
+
+and the general idea is:
+
+ - you create a fiber with `::CreateFiber()` API; it's suspended
+ - you switch to/activate/run a fiber with `::SwitchToFiber()` call
+ - you can switch only between fibers; so everything must be a fiber
+
+Last point is more specific to Win32 API:
+ 
+ - from within a `main()` entry point we are in a thread context
+ - once `::CreateFiber()` gets you a fiber to switch to, (main) thread
+   needs to be converted to a fiber with a call to `::ConvertThreadToFiber()`
+
+But, ignoring thread-to-fiber conversion, we just (a) create N fibers
+and (b) switch an execution between them. Worth mentioning: fibers still execute
+withing a thread context, meaning - context switches (between threads)
+still happen while fiber is executing.
+
+Below, we go with a `Fiber` class that encapsulates all the system APIs above.
+We'd like to have a working code that may look like this:
+
+``` cpp {.numberLines}
+void Fiber::run()
+{
+    std::println("fiber1");
+    suspend();
+    std::println("fiber2");
+}
+
+int main()
+{
+    Fiber fiber;
+    std::println("main1");
+    fiber.resume();
+    std::println("main2");
+    fiber.resume();
+    std::println("main3");
+}
+```
+
+and prints:
+
+``` {.numberLines}
+main1
+fiber1
+main2
+fiber2
+main3
+```
+
+## Fibers, basics
+
+CODE: CH0x_fiber_basic
+
+We start with a `Fiber` class that allocates a fiber:
+
+``` cpp {.numberLines}
+struct Fiber
+{
+    void* _fiber = nullptr;
+    void* _parent_fiber = nullptr;
+
+    Fiber(const Fiber&) = delete;
+    Fiber()
+    {
+        _fiber = ::CreateFiber(
+            0 // default stack size
+            , &FiberProc
+            , this); // parameter to FiberProc
+        assert(_fiber);
+    }
+    ~Fiber()
+    {
+        ::DeleteFiber(_fiber);
+        _fiber = nullptr;
+    }
+```
+
+To make our lives easier, there are few assumptions and simplifications:
+
+ - we are on x64 system, so there is no need to use extended Fibers API
+ - we assume `LPVOID` is `void*` so no Win32 API types are used (great for headers)
+ - and, given x64, `WINAPI`/`__stdcall` can be ommited, so callbacks passed to
+   Win32 API can have simple C++ declarations
+
+That's gives us next include:
+
+``` cpp {.numberLines}
+#include <Windows.h>
+// Note: the floating-point state on x86 systems is not preserved.
+// If there is need to support x86, Fiber's Ex-tended API must be used.
+#if !defined(_WIN64)
+#  error Fiber implementation does not support x86 systems.
+#endif
+#include <type_traits>
+static_assert(std::is_same_v<LPVOID, void*>);
+```
+
+Next, while Win32 Fibers can switch from any one Fiber to any other Fiber,
+we simplify and implement a Fiber that can be resumed, but when suspends -
+goes to the point of last resume (its parent). Hence, `void* _parent_fiber`.
+
+`FiberProc()` we pass to `::CreateFiber()` gets a reference to a given
+`Fiber` instance and runs it. FiberProc must never end, hence a while loop
+and a suspend if a call to run() ends:
+
+``` cpp {.numberLines}
+static void FiberProc(void* parameter)
+{
+    assert(parameter);
+    Fiber& self = *static_cast<Fiber*>(parameter);
+    while (true)
+    {
+        self.run();
+        self.suspend();
+    }
+}
+```
+
+To suspend a Fiber is to switch to our parent fiber who did resume us:
+
+``` cpp {.numberLines}
+void suspend()
+{
+    assert(_parent_fiber);
+    void* switch_to_fiber = _parent_fiber;
+    _parent_fiber = nullptr;
+    ::SwitchToFiber(switch_to_fiber);
+}
+```
+
+To resume a Fiber, we simply call `::SwitchToFiber()` for a `_fiber` we created.
+However, since when suspending, we need to know how to switch back, we remember
+current fiber as our parent:
+
+``` cpp {.numberLines}
+void resume()
+{
+    assert(_parent_fiber == nullptr);
+    _parent_fiber = ::GetCurrentFiber();
+    ::SwitchToFiber(_fiber);
+}
+```
+
+Remember, `.resume()` is, basically, a first call to a Fiber from within
+a main function/thread. That means that `::GetCurrentFiber()` is invoked
+in a context of `main()`:
+
+``` cpp {.numberLines}
+int main()
+{
+    Fiber fiber;
+    fiber.resume(); // call to ::GetCurrentFiber()??
+```
+
+To make that work, specifically for Win32 API, main thread needs to become a Fiber.
+This is what we do by having a simple RAII class:
+
+``` cpp {.numberLines}
+struct Fiber::Boot
+{
+    Boot(const Boot&) = delete;
+    Boot()
+    {
+        const void* fiber = ::ConvertThreadToFiber(nullptr);
+        assert(fiber);
+    }
+    ~Boot()
+    {
+        const auto ok = ::ConvertFiberToThread();
+        assert(ok);
+    }
+};
+```
+
+Hence, main and/or any other thread that may use Fibers, needs to
+scope `Fiber::Boot` variable on top:
+
+``` cpp {.numberLines}
+int main()
+{
+    Fiber::Boot _;
+
+    Fiber fiber;
+    std::println("main1");
+    fiber.resume();
+    std::println("main2");
+    fiber.resume();
+    std::println("main3");
+}
+```
+
+It's possible to avoid that by calling `::ConvertThreadToFiber()` on each and every
+call to `Fiber::resume()`; choose what you like more.
+
+Given a main() above, we:
+
+ - create a fiber, which is suspended initially
+ - print "main1"
+ - first call to `.resume()` switches us back to `FiberProc` that invokes `Fiber::run()`:
+
+``` cpp {.numberLines}
+void Fiber::run()
+{
+    std::println("fiber1");
+    suspend();
+    std::println("fiber2");
+}
+```
+
+that:
+
+ - prints "fiber1"
+ - suspends itself, which switches back to main (our parent fiber)
+ - main prints "main2", resumes fiber
+ - fiber prints "fiber2", exits run(), but immediately suspends itself
+ - main prints "main3"
+
+All at once:
+
+```
+main1
+fiber1
+main2
+fiber2
+main3
+```
+
+See CH0x_fiber_basic.
+
+Our run() is non-generic, but can be any user defined function/lambda. Lets fix that.
+
 # fibers (WIN32) (App_Fibers)
 # senders
 # reactive streams

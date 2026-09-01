@@ -4,7 +4,10 @@ project(ASYNC_API LANGUAGES CXX)
 add_subdirectory(CH00_cmake)
 add_subdirectory(CH01_libcurl_easy)
 add_subdirectory(CH02_libcurl_multi)
+
 add_subdirectory(CH0x_coro_await)
 add_subdirectory(CH0x_coro_curl0)
 add_subdirectory(CH0x_coro_curl)
 add_subdirectory(CH0x_coro_task)
+
+add_subdirectory(CH0x_fiber_basic)
