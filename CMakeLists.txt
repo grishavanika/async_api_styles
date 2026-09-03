@@ -11,3 +11,5 @@ add_subdirectory(CH0x_coro_curl)
 add_subdirectory(CH0x_coro_task)
 
 add_subdirectory(CH0x_fiber_basic)
+add_subdirectory(CH0x_fiber_switch)
+add_subdirectory(CH0x_fiber_callback)

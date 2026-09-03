@@ -1484,7 +1484,7 @@ fiber2
 main3
 ```
 
-## Fibers, basics
+## basic Fiber
 
 CODE: CH0x_fiber_basic
 
@@ -1662,9 +1662,401 @@ fiber2
 main3
 ```
 
-See CH0x_fiber_basic.
+## switching between Fibers
 
-Our run() is non-generic, but can be any user defined function/lambda. Lets fix that.
+CODE: CH0x_fiber_switch
+
+Section above shows how we can switch from a main to a different Fiber.
+Fiber on it's own, when suspendend, switches back to its invoker/resumer.
+However, instead of suspend, Fiber can switch execution to a different Fiber.
+While not quite used anywhere else, lets show the possibility.
+Our `Fiber::run()` must be able to run different code; lets inject any
+user-defined callback and run it:
+
+``` cpp {.numberLines}
+struct Fiber
+{
+    // For an example:
+    std::function<void ()> _callback;
+    // ...
+};
+
+void Fiber::run()
+{
+    assert(_callback);
+    _callback();
+}
+```
+
+Where main can now drive 2 Fibers at once:
+
+``` cpp {.numberLines}
+void Fiber::run()
+{
+    assert(_callback);
+    _callback();
+}
+
+int main()
+{
+    Fiber::Boot _;
+
+    Fiber fiber1;
+    Fiber fiber2;
+    fiber1._callback = [&fiber2, self = &fiber1]()
+    {
+        std::println("fiber1: start");
+        fiber2.resume(); // switch to fiber2
+        std::println("fiber1: END");
+        self->suspend(); // switch to main (=our parent)
+    };
+    fiber2._callback = [self = &fiber2]()
+    {
+        std::println("fiber2: start");
+        self->suspend(); // switch back to fiber1 (=our parent)
+        std::println("fiber2: END");
+        self->suspend(); // switch to main (=our parent)
+    };
+    std::println("main1");
+    fiber1.resume();
+    std::println("main2");
+    fiber2.resume();
+    std::println("main3");
+}
+```
+
+we:
+
+ - create 2 fibers; they are suspended
+ - print "main1"
+ - resume fiber1, that starts run(), that prints "fiber1: start"
+ - instead of suspend/switch to main, we then resume/switch to fiber2
+ - fiber2 resume prints "fiber2: start" initially; then
+ - we suspend fiber2
+ - that brings us back to our parent = fiber1
+ - print "fiber1: END"
+ - fiber1 suspends itself, that switches back to main
+ - print "main2"
+ - main resumes fiber2 which executes last print
+ - fiber2 prints "fiber2: END", ends execution by suspending itself
+ - fiber2 suspend brings back to main
+ - main prints "main3"
+
+which prints:
+
+```
+main1
+fiber1: start
+fiber2: start
+fiber1: END
+main2
+fiber2: END
+main3
+```
+
+so, while we used Win32 Fibers to implement asymmetric coroutines:
+ 
+ - we can still freely switch between Fiber(s)
+ - it does not matter if Fiber was resumed/activated from
+   a thread (main) or the other Fiber
+ - the act of switching to/resuming is to give a possibility to execute
+ - this is similar to C++20 coroutines with its `.resume()`
+ - nothing magically "runs" in the background; there should be a
+   scheduler that resumes or switches between fibers; same is true for C++20 coroutines
+ - we were able to interlieve execution of 3 fibers: main, fiber1, fiber2 -
+   all within one system thread; there are no multiple other threads
+ - fibers are executed concurrently within main thread
+
+Note, how while executing `fiber2` we (a) were resumed from 2 different contexts
+and (b) changed the parent in meantime, switching to different contexts:
+
+``` cpp {.numberLines}
+fiber2._callback = [self = &fiber2]()
+{
+    // ... from fiber1
+    self->suspend(); // switch back to fiber1 (=our parent)
+    // ... from main
+    self->suspend(); // switch to main (=our parent)
+};
+```
+
+## tasks for Fibers
+
+C++20 coroutines allow for a function to return a value:
+
+``` cpp {.numberLines}
+co::Tast<int> MyCoroutine()
+{
+    co_await Request();
+    co_return 1;
+}
+
+int main()
+{
+    co::Tast<int> task = MyCoroutine();
+    // use a task
+}
+```
+
+We need to build something similar on top of `Fiber` class:
+
+``` cpp {.numberLines}
+int MyFiber()
+{
+    this_fiber::suspend();
+    return 1;
+}
+
+int main()
+{
+    FiberTask<int> task = FF_async([] { return MyFiber(); });
+    // use a task
+}
+```
+
+Note how:
+
+ - any mention of a `Fiber` goes away
+ - there is nice interface to launch a new Fiber
+ - we can suspend itself within an execution context; and
+ - `MyFiber()` simply returns naked `int`;
+   there is no need to mark every coroutine with task-like return type.
+
+In addition, under the hood:
+
+ - we use Fibers pool to preallocate N fibers and reuse them
+ - there is simple Fibers scheduler to drive our Fibers execution
+ - use exceptions to allow cancellable fiber tasks
+
+Last one is presented just to showcase one of the possibilities;
+not required for CURL_async_get() Fiber wrapper.
+
+## cancellable Fiber task with a generic callback
+
+CODE: CH0x_fiber_callback
+
+First, we start with replacing hardcoded `Fiber::run()` with a generic
+version that uses next interface:
+
+``` cpp {.numberLines}
+// To separate `FiberTask` implementation from an actual `Fiber`.
+struct FiberCallbackBase
+{
+    void run()    { return do_run();    }
+    void resume() { return do_resume(); }
+
+    FiberCallbackBase() noexcept = default;
+    FiberCallbackBase(const FiberCallbackBase& rhs) = delete;
+protected:
+    ~FiberCallbackBase() noexcept = default;
+    virtual void do_run() = 0;
+    virtual void do_resume() {} // optional
+};
+```
+
+Where we allow a user to `run()` anything and also allow to
+be notified that Fiber is resumed. This is needed to implement
+a task cancelation: when canceled, user's defined `resume()`
+throws an exception to unwind everything in a context of fiber
+execution. Hence, our `run()` implementation becomes:
+
+``` cpp {.numberLines}
+static void FiberProc(void* parameter)
+{
+    Fiber& self = *static_cast<Fiber*>(parameter);
+    while (true)
+    {
+        self.run();
+        self.suspend();
+    }
+}
+
+void Fiber::run()
+{
+    try
+    {
+        _callback->resume();
+        _callback->run();
+    }
+    catch (...)
+    {
+        _exception = std::current_exception();
+    }
+    _callback = nullptr;
+}
+```
+
+where `_callback` and `_exception` are:
+
+``` cpp {.numberLines}
+struct Fiber
+{
+    void* _fiber = nullptr;
+    void* _parent_fiber = nullptr;
+    FiberCallbackBase* _callback = nullptr;
+    std::exception_ptr _exception;
+    // ...
+};
+```
+
+so, when `run()` enters we (a) notify a user it got
+resumed (first time) and (b) run everything. If exception
+is thrown, we just remember it and clean-up our current
+`_callback` - the execution is done and we go to suspend.
+
+What is `_callback`? This is somethig user can set on
+a `Fiber` instance allocated from a `FiberPool` (not shown yet).
+This is going to be done by a `FiberTask` under the hood.
+For now, we do everything manually:
+
+``` cpp {.numberLines}
+void Fiber::set_callback(FiberCallbackBase& callback)
+{
+    assert(_callback == nullptr);
+    _callback = &callback;
+    _exception = {};
+}
+
+struct MyCallback : FiberCallbackBase
+{
+    virtual void do_run() override
+    {
+        std::println("fiber1");
+    }
+};
+
+int main()
+{
+    Fiber::Boot _;
+
+    Fiber fiber;
+    MyCallback callback;
+    fiber.set_callback(callback);
+    std::println("main1");
+    fiber.resume();
+    std::println("main2");
+}
+```
+
+For now, we just made everything we had before more complicated.
+But the difference is that `Fiber::run()` now is generic and
+can run anything user-defined.
+
+To support exceptions (cancellation) - the rest of `FiberCallbackBase` interface
+ - our old implementation for suspend() needs to be tweak:
+
+``` cpp {.numberLines}
+void suspend()
+{
+    assert(_parent_fiber);
+    void* switch_to_fiber = _parent_fiber;
+    _parent_fiber = nullptr;
+    ::SwitchToFiber(switch_to_fiber);
+    assert(_callback);
+    _callback->resume();
+}
+```
+
+So once `::SwitchToFiber()` returns - meaning other Fiber was running and we are resumed,
+we notify a user on a new `resume()`.
+
+Finally, to check that Fiber is doing something (either running or suspended from a user code),
+we expose next function:
+
+``` cpp {.numberLines}
+bool is_busy() const
+{
+    if (_exception)
+    {
+        std::rethrow_exception(_exception);
+    }
+    return !!_callback;
+}
+```
+
+It does cover 2 things: (1) allows to see Fiber has valid user callback
+and (2) allows to throw any Fiber exception to a user. A bit weird, but
+does the job.
+
+Overall, the `Fiber` use for a single Task - becomes:
+
+1. allocate a new Fiber from a pool
+2. set a new callback
+3. resume/run the fiber to an end (is_busy() == false)
+4. return Fiber to the pool
+5. repeat for a new Task
+
+Note, that from within a Task or FiberCallbackBase, there is no access
+to a Fiber. How can we suspend a Task then? Following `std::this_thread`
+convention, we have:
+
+``` cpp {.numberLines}
+namespace this_fiber
+{
+void suspend()
+{
+    assert(::IsThreadAFiber());
+    void* fiber_data = ::GetFiberData();
+    assert(fiber_data);
+    Fiber& self = *static_cast<Fiber*>(fiber_data);
+    self.suspend();
+}
+} // namespace this_fiber
+```
+
+That allows to simply do `this_fiber::suspend()` to give up task
+execution and be re-scheduled later.
+
+Linking all the pieces together, low-level Fiber Task may look like this:
+
+``` cpp {.numberLines}
+struct MyFiberTask : FiberCallbackBase
+{
+    bool _cancel = false;
+
+    virtual void do_run() override
+    {
+        std::println("fiber1");
+        this_fiber::suspend();
+        std::println("fiber2");
+    }
+
+    virtual void do_resume() override
+    {
+        if (_cancel)
+        {
+            _cancel = false;
+            throw std::exception("canceled");
+        }
+    }
+};
+
+int main()
+{
+    Fiber::Boot _;
+
+    Fiber fiber;
+    MyFiberTask task;
+    fiber.set_callback(task);
+    std::println("main1");
+    fiber.resume();
+    std::println("main2");
+    task._cancel = true;
+    fiber.resume();
+    std::println("main3");
+}
+```
+
+This is going to be wrapped into nice `FF_async()` interface later.
+Interesting bit here is that we cancel fiber task in the middle
+of its execution and "fiber2" console line is not printed:
+
+```
+main1
+fiber1
+main2
+main3
+```
 
 # fibers (WIN32) (App_Fibers)
 # senders
