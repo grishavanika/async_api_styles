@@ -2058,6 +2058,498 @@ main2
 main3
 ```
 
+## basic FiberPool
+
+CODE: CH0x_fiber_task
+
+The idea is simple: fiber task can be small and short-lived,
+there is no point allocating (and dealocating) a
+system Fiber every time task is created.
+Hence, we preallocate a pool of N (=128) system
+Fibers that are always alive and reuse them. That means:
+
+ - there can be up to N Fiber(s) alive; and
+ - all system resources are allocated once and never released
+
+`FiberPool` interface may look like this:
+
+``` cpp {.numberLines}
+struct FiberPool
+{
+    using Handle = std::size_t;
+    explicit FiberPool(std::size_t size) noexcept
+
+    Handle allocate(FiberCallbackBase& callback);
+    void free(Handle handle);
+
+    void suspend(Handle handle);
+    void resume(Handle handle);
+    bool is_busy(Handle handle) const;
+
+private:
+    std::unique_ptr<Fiber[]> _fibers;
+    std::size_t _size = 0;
+};
+```
+
+where `Fiber` instance is hidden from a user and exposed only
+with a `Handle`. So we can manage an array of fixed size internally:
+
+``` cpp {.numberLines}
+explicit FiberPool::FiberPool(std::size_t size) noexcept
+{
+    assert(size > 0);
+    _fibers.reset(new(std::nothrow) Fiber[size]);
+    assert(_fibers.get());
+    _size = size;
+}
+```
+
+To create a Fiber is to invoke an `allocate()`. Note, we go as
+dumb and as simple as possible - doing linear search to find
+first free Fiber. It all could be made better, having basic freelist
+allocator for indices as one way to go about it:
+
+``` cpp {.numberLines}
+Handle FiberPool::allocate(FiberCallbackBase& callback)
+{
+    auto find_first_free_handle = [this]()
+    {
+        for (std::size_t i = 0; i < _size; ++i)
+        {
+            if (_fibers[i]._callback == nullptr)
+            {
+                return Handle(i);
+            }
+        }
+        assert(false);
+        return Handle(-1);
+    };
+    const Handle handle = find_first_free_handle();
+    Fiber& fiber = _fibers[handle];
+    fiber.set_callback(callback);
+    return handle;
+}
+```
+
+`FiberPool::free()` is, basically, no-op. We asset `Fiber`
+returned is in "complete" state - finished execution:
+
+``` cpp {.numberLines}
+void FiberPool::free(Handle handle)
+{
+    assert(handle < _size);
+    assert(_fibers[handle]._callback == nullptr);
+}
+```
+
+Next, `suspend()`, resume() and is_busy() are just a
+wrappers around Fiber API, but for a `Handle`:
+
+``` cpp {.numberLines}
+void FiberPool::suspend(Handle handle)
+{
+    assert(handle < _size);
+    _fibers[handle].suspend();
+}
+```
+
+With all this, our previous example running fiber task becomes:
+
+``` cpp {.numberLines}
+int main()
+{
+    Fiber::Boot _;
+    FiberPool fiber_pool{128};
+
+    MyFiberTask task;
+    FiberPool::Handle fiber = fiber_pool.allocate(task);
+    fiber_pool.resume(fiber);
+    fiber_pool.free(fiber);
+}
+```
+
+Now, lets get rid of manually created MyFiberTask and make `FiberTask<T>` possible.
+
+## FiberTask
+
+CODE: CH0x_fiber_task
+
+We'd like to be able to write something like this:
+
+``` cpp {.numberLines}
+int MyFiber()
+{
+    this_fiber::suspend();
+    return 1;
+}
+
+int main()
+{
+    FiberTaskScheduler scheduler;
+    FiberTask<int> task = FF_async(scheduler, [] { return MyFiber(); });
+    // ...
+    // scheduler.schedule();
+}
+```
+
+There are several moving parts:
+
+1. we need type-erased implementation of FiberTask that can
+   consume any user-defined lambda/callback, work with any return type `T`; and
+2. we need a scheduler that knows how to drive tasks/fibers
+   execution
+
+`FiberTask<T>` allocates a Fiber, runs a given callable/lambda and stores
+the result. Given FiberTask can be destroyed by a user any time, the way
+we handle this is to ensure that actual FiberTask state is owned
+by `FiberTaskScheduler`: if FiberTask is destroyed while still running,
+we cancel `Fiber` and free it later, once the execution is done.
+
+Interestingly, there could be up to N active Fibers (FiberPool capacity),
+but FiberTasks count owned by a user can be larger. Consider next code:
+
+``` cpp {.numberLines}
+FiberTask<void> m_tasks[N];
+for (...) { m_tasks[i] = FF_async(...) }
+// N Fiber tasks completes
+// 
+// User still owns N m_tasks and may query
+// the status and result - any time later.
+```
+
+Going with more optimized implementation, we could:
+
+ - preallocate N system Fibers
+ - preallocate a memory for up to M (>=N) fiber Tasks
+ - each fiber Task could be limited in size (let 256 bytes); and
+ - each Task could free Fiber as soon as task ends
+
+i.e., Fiber and Task lifetime could be different and
+everything is preallocated; meaning no allocations at runtime.
+
+For simpler implementation, we (a) bind Fiber lifetime to a Task lifetime:
+Fiber is released only when Task is destroyed; and (b) Task
+allocates on creation, going with more standard code for type-erased implementation.
+
+With this in mind, we start with FiberTask_Any:
+
+``` cpp {.numberLines}
+struct FiberTask_Any : public FiberCallbackBase
+{
+    explicit FiberTask_Any(FiberPool& fiber_pool);
+    virtual ~FiberTask_Any() noexcept;
+
+    bool is_completed() const;
+    void execute();
+    void cancel();
+
+private:
+    virtual void do_resume() override;
+
+protected:
+    FiberPool& _fiber_pool;
+    FiberPool::Handle _fiber;
+    bool _cancelled = false;
+};
+```
+
+that implements FiberCallbackBase interface and
+can be cancelled, but knows nothing on how to
+store the result of execution:
+
+``` cpp {.numberLines}
+FiberTask_Any::FiberTask_Any(FiberPool& fiber_pool)
+    : _fiber_pool(fiber_pool)
+    , _fiber(fiber_pool.allocate(*this))
+{
+}
+FiberTask_Any::~FiberTask_Any() noexcept
+{
+    assert(is_completed());
+    _fiber_pool.free(_fiber);
+}
+```
+
+For cancellation, we throw an exception when Fiber is
+resumed:
+
+``` cpp {.numberLines}
+class Exception_FiberTaskCancelled : public std::exception
+{
+};
+
+void FiberTask_Any::cancel()
+{
+    assert(_cancelled == false);
+    _cancelled = true;
+}
+
+void FiberTask_Any::do_resume()
+{
+    if (_cancelled)
+    {
+        _cancelled = false;
+        throw Exception_FiberTaskCancelled{};
+    }
+}
+```
+
+To execute task is to resume a Fiber:
+
+``` cpp {.numberLines}
+void FiberTask_Any::execute()
+{
+    assert(is_completed() == false);
+    _fiber_pool.resume(_fiber);
+}
+```
+
+Finally, `is_completed()` check looks for a Fiber
+that ended the execution and/or has an exception thrown:
+
+``` cpp {.numberLines}
+bool FiberTask_Any::is_completed() const
+{
+    try
+    {
+        return (_fiber_pool.is_busy(_fiber) == false);
+    }
+    catch (...)
+    {
+    }
+    return true;
+}
+```
+
+To handle void and non-void return types, we introduce FiberTask_WithResult:
+
+``` cpp {.numberLines}
+template<typename R>
+struct FiberTask_WithResult : public FiberTask_Any
+{
+public:
+    using FiberTask_Any::FiberTask_Any;
+    const R& get() const;
+    R&& get_once()
+    {
+        const R& r = static_cast<const FiberTask_WithResult&>(*this).get();
+        return std::move(const_cast<R&>(r));
+    }
+protected:
+    // In case return type is not DefaultConstructiable.
+    std::variant<std::monostate, R> _storage;
+};
+
+template<>
+struct FiberTask_WithResult<void> : public FiberTask_Any
+{
+public:
+    using FiberTask_Any::FiberTask_Any;
+    void get() const;
+    void get_once()
+    {
+        return static_cast<const FiberTask_WithResult&>(*this).get();
+    }
+};
+```
+
+where non-void FiberTask places the result in the `_storage` data member.
+`get_once()` is just a `get()` that give rvalue reference back so
+it could be moved from. `get()` implementation is just:
+
+``` cpp {.numberLines}
+const R& get() const
+{
+    // Populate exception, if any.
+    const bool running = _fiber_pool.is_busy(_fiber);
+    assert(running == false);
+    assert(_storage.index() == 1);
+    return std::get<1>(_storage);
+}
+```
+
+Note how we must check Fiber's `is_busy()` to populate any exception
+to the user if something was throws during Fiber execution.
+
+Finally, to run a lambda, we go with FiberTask_Callable:
+
+``` cpp {.numberLines}
+template<typename R, typename C>
+struct FiberTask_Callable : public FiberTask_WithResult<R>
+{
+    using Base = FiberTask_WithResult<R>;
+public:
+    explicit FiberTask_Callable(C&& callable, FiberPool& fiber_pool)
+        : Base(fiber_pool)
+        , _callable(std::move(callable))
+    {
+    }
+private:
+    virtual void do_run() override
+    {
+        if constexpr (std::is_same_v<void, R>)
+        {
+            _callable();
+        }
+        else
+        {
+            this->_storage.template emplace<1>(_callable());
+        }
+    }
+private:
+    C _callable;
+};
+```
+
+FiberTask_Callable is what's going to be allocated on every `FF_async()`
+call that creates a `FiberTask<T>`:
+
+``` cpp {.numberLines}
+template<typename R>
+struct FiberTask
+{
+    using Task = FiberTask_WithResult<R>;
+
+    template<typename C>
+    explicit FiberTask(C&& callable, FiberTaskScheduler& scheduler) noexcept
+        : _scheduler(&scheduler)
+    {
+        using TaskCallable = FiberTask_Callable<R, std::remove_cvref_t<C>>;
+        TaskCallable* task = new(std::nothrow) TaskCallable(std::forward<C>(callable), scheduler._fiber_pool);
+        assert(task);
+        scheduler.add_fiber_task(std::unique_ptr<FiberTask_Any>(task));
+        _task = task;
+    }
+    ~FiberTask() noexcept
+    {
+        destroy_once();
+    }
+    void destroy_once() noexcept
+    {
+        if (_scheduler)
+        {
+            assert(_task);
+            _scheduler->remove_fiber_task(*_task);
+            _scheduler = nullptr;
+            _task = nullptr;
+        }
+    }
+    decltype(auto) get() const;
+    decltype(auto) get_once();
+// ...
+    FiberTaskScheduler* _scheduler = nullptr;
+    Task* _task = nullptr;
+};
+
+template<typename C>
+auto FF_async(FiberTaskScheduler& scheduler, C&& callable)
+{
+    using Task = FiberTask<std::invoke_result_t<C>>;
+    return Task{std::forward<C>(callable), scheduler};
+}
+```
+
+`_task` itself is owned by a FiberTaskScheduler:
+
+``` cpp {.numberLines}
+struct FiberTaskScheduler
+{
+    FiberPool& _fiber_pool;
+    std::vector<std::unique_ptr<FiberTask_Any>> _tasks;
+    std::vector<FiberTask_Any*> _tasks_to_remove;
+
+    void add_fiber_task(std::unique_ptr<FiberTask_Any>&& task)
+    {
+        assert(task.get());
+        _tasks.push_back(std::move(task));
+    }
+    void remove_fiber_task(FiberTask_Any& task)
+    {
+        if (task.is_completed() == false)
+        {
+            task.cancel();
+        }
+        _tasks_to_remove.push_back(&task);
+    }
+```
+
+Note how removing a task is also a cancel if needed.
+
+We are left with `FiberTaskScheduler` execution, which is its `schedule()`:
+
+``` cpp {.numberLines}
+void FiberTaskScheduler::schedule()
+{
+    while (schedule_once()) {}
+}
+
+bool FiberTaskScheduler::schedule_once()
+{
+    bool repeat = false;
+    auto tasks = std::move(_tasks);
+    for (auto it = tasks.rbegin(); it != tasks.rend(); ++it)
+    {
+        std::unique_ptr<FiberTask_Any>& task = *it;
+        assert(task);
+        if (task->is_completed() == false)
+        {
+            task->execute();
+            repeat |= task->is_completed();
+            continue;
+        }
+        auto it_remove = std::find(_tasks_to_remove.begin(), _tasks_to_remove.end(), task.get());
+        if (it_remove == _tasks_to_remove.end())
+        {
+            continue;
+        }
+        task.reset();
+    }
+    for (std::unique_ptr<FiberTask_Any>& task : tasks)
+    {
+        if (task)
+        {
+            _tasks.push_back(std::move(task));
+        }
+    }
+    return repeat;
+}
+```
+
+There are 2 moments worth mentioning:
+
+1. tasks are executed from the end - this is needed to execute
+   child tasks first so parent tasks that wait can have progress
+2. if any task is completed, we schedule a loop again - again
+   so any parent tasks can complete if child tasks complete
+
+Other then that, we just `.execute()` every task and remove it
+when completed and was removed.
+
+Finally, running a FiberTask is:
+
+``` cpp {.numberLines}
+int MyFiber()
+{
+    this_fiber::suspend();
+    return 1;
+}
+
+int main()
+{
+    Fiber::Boot _;
+    FiberPool fiber_pool{128};
+    FiberTaskScheduler fibers_scheduler{fiber_pool};
+
+    FiberTask<int> task = FF_async(fibers_scheduler, &MyFiber);
+    while (task.is_completed() == false)
+    {
+        fibers_scheduler.schedule();
+    }
+    std::println("{}", task.get()); // prints "1"
+}
+```
+
 # fibers (WIN32) (App_Fibers)
 # senders
 # reactive streams
