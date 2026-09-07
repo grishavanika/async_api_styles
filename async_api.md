@@ -2,16 +2,15 @@
 title: Asynchronous API
 include-before: |
 
-    I showcase different variations of asynchronous APIs with examples
-    of using libcurl, specifically, doing 2 GET requests -
-    both sequentially and concurrently.
+    Below, we showcase different variations of asynchronous APIs
+    built on top of C-style callbacks with examples of
+    doing 2 GET requests - both sequentially and concurrently.
 
-    NO threads are involved to disconnect any associations
-    of coroutines or fibers with multithreading. Something is intentionally
-    simpler, while still having as much details as possible.
+    NO threads are involved intentionally, to disconnect any associations
+    of coroutines or fibers with multithreading. Some parts are
+    deliberately simple, while still presenting as much details as possible.
 
-    Jump to [tasks](#tasks), [std::future](#future),
-    [coroutines](#coroutines), [fibers](#fibers), [senders](#senders).
+    Jump to tasks, std::future, coroutines, fibers, senders. TODO: App_X.
 
     [Work In Progress]{.mark}.
 
@@ -21,8 +20,9 @@ include-before: |
 
 # introduction {#intro}
 
-I start with a simple C-style API on top of [libcurl C API](https://curl.se/libcurl/c/)
-and have a code that may look like this:
+We start with a simple C-style API on top of
+[libcurl C API](https://curl.se/libcurl/c/) and have a code that may
+look like this:
 
 ``` cpp {.numberLines}
 // our CURL API
@@ -32,14 +32,16 @@ int main()
 {
     const std::string r1 = CURL_get("localhost:5001/file1.txt");
     const std::string r2 = CURL_get("localhost:5001/file2.txt");
-    return int(r1.size() + r2.size()); // handle results
+    std::println("{}", r1);
+    std::println("{}", r2);
 }
 ```
 
-The code above performs two GET requests sequentially. Everything executes synchronously.
+The code above performs two GET requests sequentially. Everything executes
+synchronously.
 
-Next, lets have simple C-style callbacks API, intentionally,
-**not** C++ one, see [the note](#libcurl_c_style), to run requests concurrently:
+Next, lets have a simple C-style callbacks API (**not** the C++ one, see
+[the note](#libcurl_c_style)), to run requests concurrently:
 
 ``` cpp {.numberLines}
 // libcurl bookkeeping
@@ -88,25 +90,27 @@ int main()
         CURL_async_tick(curl_async);
     }
     CURL_async_destroy(curl_async);
-    return int(state.r1.size() + state.r2.size());
+    std::println("{}", state.r1);
+    std::println("{}", state.r2);
 }
 ```
 
 There is a need to have a `State` for bookkeeping, pass it as a
 `void*` user data to access later and, finally, run an event loop
 to give libcurl a chance to process requests. Note, however,
-requests execute concurrently now, as in - 2 requests are active at the same time.
+requests execute concurrently now, as in - 2 requests are active at the
+same time.
 
-After this, lets build [tasks](#tasks), [std::future](#future),
-[coroutines](#coroutines), [fibers](#fibers), [senders](#senders) and other
-variations of asynchronous API on top of C-style callbacks above.
+After this, lets build tasks, std::future, coroutines, fibers,
+senders and other variations of asynchronous API on top of C-style
+callbacks above.
 
 But before that, lets wrap [libcurl C API](https://curl.se/libcurl/c/)
 for our needs.
 
 --------------------------------------------------------------------------------
 
-# setup with cmake + libcurl {#cmake}
+# setup with CMake + libcurl {#cmake}
 
 CODE: CH00_cmake
 
@@ -120,8 +124,8 @@ cd vcpkg
 bootstrap-vcpkg.bat
 ```
 
-I also set VCPKG_ROOT that points to specific full path I have (`K:\vcpkg`)
-and add this path to `PATH` environemnt variable so build scripts
+Assuming vcpkg is installed at `K:\vcpkg`, we also set VCPKG_ROOT 
+and add this path to `PATH` environment variable so build scripts
 can use `VCPKG_ROOT` and `vcpkg` without a need to know the exact location.
 
 ``` bash {.numberLines}
@@ -129,16 +133,15 @@ set VCPKG_ROOT=K:\vcpkg
 set PATH=%VCPKG_ROOT%;%PATH%
 ```
 
-For the project (async_api), vcpkg [manifest mode](https://learn.microsoft.com/vcpkg/consume/manifest-mode)
+For the project (lets say in a `K:\async_api` folder), vcpkg
+[manifest mode](https://learn.microsoft.com/vcpkg/consume/manifest-mode)
 is used. Together with `curl` setup, all required steps are
 
 ``` bash {.numberLines}
-cd async_api
+cd K:\async_api
 vcpkg new --application
 vcpkg add port curl
 ```
-
-I have async_api folder as `K:\async_api`, but it can be anywhere else.
 
 Note that to find exact `curl` package name, `vcpkg search curl` was used which
 prints:
@@ -184,35 +187,35 @@ int main()
 Finally, to invoke CMake configure, build and run (with vcpkg):
 
 ``` bash {.numberLines}
-cd async_api
-cmake -S . -B build ^
+cd K:\async_api
+cmake -S . -B __build ^
   -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
-cmake --build build --config Debug
+cmake --build __build --config Debug
 :: run a test
-.\build\00_cmake_libcurl\Debug\00_cmake_libcurl.exe
+.\__build\CH00_cmake\Debug\CH00_cmake.exe
 ```
 
-This assumes cmake.exe is in your `PATH`, see `build.cmd`.
+This assumes `cmake.exe` is in your `PATH`, see `build.cmd`.
 
 # building blocking API {#libcurl_easy}
 
 CODE: CH01_libcurl_easy
 
-Blocking, synchronous API for GET request is straightforward.
-I go with a function that looks like this:
+Blocking, synchronous API for a GET request is straightforward.
+We go with a function that looks like this:
 
 ``` cpp {.numberLines}
 std::string CURL_get(const std::string& url);
 ```
 
 libcurl comes with two different APIs,
-["easy" and "multi"](https://curl.se/libcurl/c/). Lets use easy interface;
-libcurl examples available online, including official [simple.c example](https://curl.se/libcurl/c/simple.html)
-for a start.
+["easy" and "multi"](https://curl.se/libcurl/c/). Lets use an easy interface;
+libcurl examples available online, including official
+[simple.c example](https://curl.se/libcurl/c/simple.html) for a start.
 
 Everything together leads to the implementation below, where
 `curl_easy_perform()` call is the main one that blocks the execution
-until request complete; once complete, we can return results:
+until request completes; once complete, we can return results:
 
 ``` cpp {.numberLines}
 #include <string>
@@ -224,7 +227,8 @@ until request complete; once complete, we can return results:
 #endif
 #include <cassert>
 
-static size_t CURL_OnWriteCallback(void* ptr, size_t size, size_t nmemb, void* data)
+static size_t CURL_OnWriteCallback(
+    void* ptr, size_t size, size_t nmemb, void* data)
 {
     std::string& response = *static_cast<std::string*>(data);
     response.append(static_cast<const char*>(ptr), size * nmemb);
@@ -242,7 +246,8 @@ std::string CURL_get(const std::string& url)
     assert(status == CURLE_OK);
     
     std::string response;
-    status = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CURL_OnWriteCallback);
+    status = curl_easy_setopt(curl
+        , CURLOPT_WRITEFUNCTION, CURL_OnWriteCallback);
     assert(status == CURLE_OK);
     status = curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     assert(status == CURLE_OK);
@@ -288,7 +293,8 @@ int main()
 ```
 
 that.. should crash since we don't have local HTTP server running to serve
-`localhost:5001/file1.txt`. See the [next section on how to make it happen](#serve).
+`localhost:5001/file1.txt`. See the
+[next section on how to make it happen](#serve).
 
 Once done, we should see the sample file1.txt content in the console output:
 
@@ -308,8 +314,9 @@ files in the current directory, see `serve.cmd`:
 python -m http.server 5001
 ```
 
-Given the directory that has file1.txt and file2.txt, `CURL_get("localhost:5001/file1.txt")`
-should work and return the content of the file, see [blocking libcurl section](#libcurl_easy).
+Given the directory that has file1.txt and file2.txt,
+`CURL_get("localhost:5001/file1.txt")` should work and return the content
+of the file, see [blocking libcurl section](#libcurl_easy).
 
 # building C-style callbacks API {#libcurl_multi}
 
@@ -319,7 +326,7 @@ CODE: CH02_libcurl_multi
 
 Now, lets imagine simplest possible asynchronous API. The difference to
 [blocking API](#libcurl_easy) is that we ask the system to start a GET request
-and the response should arrive some time later. The system invokes a
+and the response could arrive some time later. The system invokes a
 user-provided `callback` to notify us once everything is done:
 
 ``` cpp {.numberLines}
@@ -361,8 +368,8 @@ void CURL_async_destroy(CURL_Async curl_async);
 ```
 
 where `CURL_Async` is the system itself, since user does not care what's that
-exactly, it's hidden under `void*`. User could create the system, use it and,
-once not needed, destroy - to clean up resources, if any.
+exactly, it's hidden under `void*`. User creates the system, uses it and,
+once not needed, destroys to clean up resources, if any.
 
 To drive a system with event loop, user must call the next API:
 
@@ -373,7 +380,7 @@ void CURL_async_tick(CURL_Async curl_async);
 This is the chance for a system to actually do some work over time **and**
 invoke user-provided callbacks, if needed.
 
-Lastly, to give a user some controll over data in the callback, we pass
+Lastly, to give a user some control over data in the callback, we pass
 opaque `void*` pointer around:
 
 ``` cpp {.numberLines}
@@ -391,7 +398,8 @@ while request is in progress.
 There are more nuances, like how frequently/when `CURL_async_tick()` should be
 invoked by a user; but all this is left out of the scope.
 
-Overall, everything included, we need to implement next API, see [below](#libcurl_multi_impl):
+Overall, everything included, we need to implement the next API,
+see [below](#libcurl_multi_impl):
 
 ``` cpp {.numberLines}
 // libcurl bookkeeping
@@ -431,8 +439,8 @@ curl.get("localhost:5001/file1.txt", [](std::string r)
 curl.tick(); // etc
 ```
 
-However, C-style API we have is defacto standard, familiar
-and reconized for asynchronous APIs with callbacks (citation needed).
+However, C-style API we have, is a de-facto standard, familiar
+and recognized for asynchronous APIs with callbacks (citation needed).
 
 The rest of asynchronous APIs implementations below are built on top of 
 C-style callback API, as a basic building block to cover similar
@@ -442,7 +450,7 @@ callbacks-based APIs.
 
 CODE: CH02_libcurl_multi
 
-For our [API](#libcurl_multi_design):
+For our callbacks [API](#libcurl_multi_design):
 
 ``` cpp {.numberLines}
 using CURL_Async = void*;
@@ -491,7 +499,8 @@ CURL_Async CURL_async_create()
 void CURL_async_destroy(CURL_Async curl_async)
 {
     assert(curl_async);
-    CURL_AsyncScheduler* scheduler = static_cast<CURL_AsyncScheduler*>(curl_async);
+    CURL_AsyncScheduler* scheduler =
+        static_cast<CURL_AsyncScheduler*>(curl_async);
     delete scheduler;
 }
 ```
@@ -503,7 +512,8 @@ Before implementing internals, lets have a helper function that gets actual
 ``` cpp {.numberLines}
 CURL_AsyncScheduler& CURL_scheduler(CURL_Async curl_async)
 {
-    CURL_AsyncScheduler* scheduler = static_cast<CURL_AsyncScheduler*>(curl_async);
+    CURL_AsyncScheduler* scheduler =
+        static_cast<CURL_AsyncScheduler*>(curl_async);
     assert(scheduler);
     return *scheduler;
 }
@@ -528,7 +538,8 @@ void CURL_async_get(CURL_Async curl_async
     
     // 2. write response data to separate std::string
     std::string* state = new std::string{};
-    status = curl_easy_setopt(curl_easy, CURLOPT_WRITEFUNCTION, CURL_OnWriteCallback);
+    status = curl_easy_setopt(curl_easy
+        , CURLOPT_WRITEFUNCTION, CURL_OnWriteCallback);
     assert(status == CURLE_OK);
     status = curl_easy_setopt(curl_easy, CURLOPT_WRITEDATA, state);
     assert(status == CURLE_OK);
@@ -538,7 +549,8 @@ void CURL_async_get(CURL_Async curl_async
         , [state, user_data, callback](CURL* curl_easy)
     {
         long response_code = -1;
-        const CURLcode status = curl_easy_getinfo(curl_easy, CURLINFO_RESPONSE_CODE, &response_code);
+        const CURLcode status = curl_easy_getinfo(curl_easy
+            , CURLINFO_RESPONSE_CODE, &response_code);
         assert(status == CURLE_OK);
         assert(response_code == 200L);
         curl_easy_cleanup(curl_easy);
@@ -553,16 +565,18 @@ There are few moving parts and issues:
 
  1. we create and setup curl easy handle in the same way as for blocking call;
  2. we allocate separate `std::string` to write the response data to with the
-    same `CURL_OnWriteCallback` callback as in [blocking implementation](#libcurl_easy);
+    same `CURL_OnWriteCallback` callback as in the
+    [blocking implementation](#libcurl_easy);
  3. finally, we associate the request with event loop/multi handle
  4. new `std::string` will leak the memory if the request is not completed
- 5. overall, there are more hidden alocations from within `add_request()`:
+ 5. overall, there are more hidden allocations from within `add_request()`:
     a) std::function<> most likely allocates
     b) std::unordered_map allocates
 
 It could be done another way around, eliminating the need for separate
 `std::string` allocation and few more optimizations, mainly with the help of
-[associating user data with curl easy handle/CURLOPT_PRIVATE](https://curl.se/libcurl/c/CURLOPT_PRIVATE.html).
+associating user data with curl easy handle/
+[CURLOPT_PRIVATE](https://curl.se/libcurl/c/CURLOPT_PRIVATE.html).
 However, it's good enough for illustrative purposes.
 
 After creation of curl easy handle, we associate it with curl multi handle:
@@ -676,7 +690,6 @@ If [python HTTP server](#serve) is running, our program should print:
 
 ```
 async response: 'content 1'
-
 ```
 
 # blocking, synchronous (App_Blocking) {#sync}
@@ -705,7 +718,7 @@ Coroutines materials:
 
  - [How C++ coroutines work](https://kirit.com/How%20C%2B%2B%20coroutines%20work).
  - All of [Asymmetric Transfer](https://lewissbaker.github.io/),
-   author of [cppcoro](https://github.com/lewissbaker/cppcoro).
+  author of [cppcoro](https://github.com/lewissbaker/cppcoro).
 
 In short, we'd like to be able to write something like this:
 
@@ -739,7 +752,7 @@ Co_Task coro_work(CURL_Async curl_async)
 ```
 
 And, finally, there are some challenges to have a code that has several GET
-requests on the fly with coroutines.
+requests on the fly, with coroutines.
 
 Lets start with basics.
 
@@ -747,7 +760,7 @@ Lets start with basics.
 
 CODE: CH0x_coro_task
 
-There is a trick to writing some basic C++20 coroutines code - **listen to
+There is a trick to writing some basic C++20 coroutines code - **listen to the
 compiler**. Lets see what it takes to make the next code "work":
 
 ``` cpp {.numberLines}
@@ -843,8 +856,8 @@ MSVC complains:
 main.cc(164,12): error C3781: Co_Task::promise_type: a coroutine's
                  promise must declare either
                  'return_value' or 'return_void'
-main.cc(176,1): error C2039: 'unhandled_exception': is not a member
-                of 'Co_Task::promise_type'
+main.cc(176,1):  error C2039: 'unhandled_exception': is not a member
+                 of 'Co_Task::promise_type'
 ```
 
 Since our `coro_work()` coroutine has just `co_return`, we should provide
@@ -868,7 +881,7 @@ main.cc(168,29): error C5231: the expression
                  'co_await promise.final_suspend()' must be non-throwing
 ```
 
-Ok, makes sense. Finally,
+OK, makes sense. Finally,
 
 ``` cpp {.numberLines}
 #include <coroutine>
@@ -945,11 +958,11 @@ struct Co_Task
 In short, when we call `coro_work()`, compiler creates `Co_Task::promise_type`
 and invokes `get_return_object()` to be able to return an instance of `Co_Task`
 to the user. Here, in `get_return_object()` there is a way to get an access
-to `std::coroutine_handle<>` - the only way to interact with just alocated
+to `std::coroutine_handle<>` - the only way to interact with just allocated
 coroutine. Once `Co_Task` is created, we return it to the user.
-It's **up to the user** to manage `std::coroutine_handle<>`. In our case, we own just created
-coroutine, hence if `Co_Task` is destroyed, we assume coroutine is in suspended
-state and destroy it too.
+It's **up to the user** to manage `std::coroutine_handle<>`.
+In our case, we own just created coroutine, hence if `Co_Task` is destroyed,
+we assume coroutine is in suspended state and destroy it too.
 
 Writing down the rest of functions:
 
@@ -1065,8 +1078,8 @@ The compiler asks awaiter, specifically, `Co_CurlAsync` with
 `bool await_ready()` if operation is done/ready or is in progress. If awaiter
 returns false, the compiler switches current coroutine state to "suspended"
 and invokes awaiter's `await_suspend(std::coroutine_handle<> coro)`
-customization point which allows to remember currently suspended coroutine `coro` handle,
-to call `.resume()` later, once operation is done.
+customization point which allows to remember currently suspended coroutine
+`coro` handle, to call `.resume()` later, once operation is done.
 Once coroutine is resumed, compiler asks for a value from last awaiter
 responsible for suspend.
 
@@ -1275,7 +1288,7 @@ changes and the code around.
 3rd solution requires changes to our basic C-style callback API which we assume
 we can't do (since, otherwise, the interface is more advanced).
 
-4th solution is the most ineficient and requires no changes neither in Co_Task
+4th solution is the most inefficient and requires no changes neither in Co_Task
 nor in callback API.
 
 ## C++ coroutines, await callback (no crash)
@@ -1315,7 +1328,7 @@ in progress, the flow is:
 2) destroy Co_CurlAsync
 3) invoke callback (access this/dead coroutine)
 
-Lets alocate a separate object that can outlive the coroutine/await.
+Lets allocate a separate object that can outlive the coroutine/await.
 There is an assumption that `CURL_async_get()` callback is always
 going to be invoked. Given this, we:
 
@@ -1376,7 +1389,7 @@ reference to it as null so `CURL_async_get()` knows it's not alive:
 }
 ```
 
-That's how you write ineficient coroutine types for a systems
+That's how you write inefficient coroutine types for a systems
 that know nothing about coroutines. When doing simple call:
 
 ``` cpp {.numberLines}
@@ -1390,7 +1403,8 @@ we:
  2. CURL_await_get allocates `WaitState`
  3. CURL_async_get allocates `std::string` to write a response
  4. CURL_async_get allocates `std::function` for a generic callback
- 5. CURL_async_get allocates `std::unordered_map` node to remember what to call when
+ 5. CURL_async_get allocates `std::unordered_map` node to remember
+    what to call when
  6. .. and probably something else (CURL internals, etc)
 
 "simple" CURL_async_get() implementation alone brings 3 allocations.
@@ -1399,7 +1413,7 @@ we:
 With CURL scheduler that **knows** about coroutines and few more
 optimizations and limitations, this number of allocations can go down to amortized 0:
 
- * CURL scheduler prealocates up to N max requests
+ * CURL scheduler preallocates up to N max requests
  * request itself knows how to store the response and coroutine-callback inline
  * coroutine itself re-uses memory pool for up to N max active coroutines.
 
@@ -1429,11 +1443,14 @@ basic idea in a simpler form.
 
 Going with Win32 Fibers, short intro is:
 
- - fibers allow to suspend and resume execution at any given point inside a function
- - they are stackful coroutines, as opposed to C++20 coroutines that are stackless
+ - fibers allow to suspend and resume execution at any given point
+   inside a function
+ - they are stackful coroutines, as opposed to C++20 coroutines
+   that are stackless
  - they implement symmetric coroutines (same as C++20 coroutines);
    we'll build asymmetric coroutines on top of Fibers
  - it should be trivial to ifdef POSIX implementation
+   using deprecated `ucontext.h`
 
 and the general idea is:
 
@@ -1515,11 +1532,12 @@ struct Fiber
 To make our lives easier, there are few assumptions and simplifications:
 
  - we are on x64 system, so there is no need to use extended Fibers API
- - we assume `LPVOID` is `void*` so no Win32 API types are used (great for headers)
- - and, given x64, `WINAPI`/`__stdcall` can be ommited, so callbacks passed to
+ - we assume `LPVOID` is `void*` so no Win32 API types are used
+   (great for headers)
+ - and, given x64, `WINAPI`/`__stdcall` can be omitted, so callbacks passed to
    Win32 API can have simple C++ declarations
 
-That's gives us next include:
+That gives us next include:
 
 ``` cpp {.numberLines}
 #include <Windows.h>
@@ -1589,8 +1607,8 @@ int main()
     fiber.resume(); // call to ::GetCurrentFiber()??
 ```
 
-To make that work, specifically for Win32 API, main thread needs to become a Fiber.
-This is what we do by having a simple RAII class:
+To make that work, specifically for Win32 API, main thread needs to become
+a Fiber. This is what we do by having a simple RAII class:
 
 ``` cpp {.numberLines}
 struct Fiber::Boot
@@ -1626,14 +1644,15 @@ int main()
 }
 ```
 
-It's possible to avoid that by calling `::ConvertThreadToFiber()` on each and every
-call to `Fiber::resume()`; choose what you like more.
+It's possible to avoid that by calling `::ConvertThreadToFiber()`
+on each and every call to `Fiber::resume()`; choose what you like more.
 
 Given a main() above, we:
 
  - create a fiber, which is suspended initially
  - print "main1"
- - first call to `.resume()` switches us back to `FiberProc` that invokes `Fiber::run()`:
+ - first call to `.resume()` switches us back to `FiberProc`
+   that invokes `Fiber::run()`:
 
 ``` cpp {.numberLines}
 void Fiber::run()
@@ -1667,7 +1686,7 @@ main3
 CODE: CH0x_fiber_switch
 
 Section above shows how we can switch from a main to a different Fiber.
-Fiber on it's own, when suspendend, switches back to its invoker/resumer.
+Fiber on it's own, when suspended, switches back to its invoker/resumer.
 However, instead of suspend, Fiber can switch execution to a different Fiber.
 While not quite used anywhere else, lets show the possibility.
 Our `Fiber::run()` must be able to run different code; lets inject any
@@ -1762,7 +1781,8 @@ so, while we used Win32 Fibers to implement asymmetric coroutines:
  - the act of switching to/resuming is to give a possibility to execute
  - this is similar to C++20 coroutines with its `.resume()`
  - nothing magically "runs" in the background; there should be a
-   scheduler that resumes or switches between fibers; same is true for C++20 coroutines
+   scheduler that resumes or switches between fibers;
+   same is true for C++20 coroutines
  - we were able to interlieve execution of 3 fibers: main, fiber1, fiber2 -
    all within one system thread; there are no multiple other threads
  - fibers are executed concurrently within main thread
@@ -1904,7 +1924,7 @@ resumed (first time) and (b) run everything. If exception
 is thrown, we just remember it and clean-up our current
 `_callback` - the execution is done and we go to suspend.
 
-What is `_callback`? This is somethig user can set on
+What is `_callback`? This is something user can set on
 a `Fiber` instance allocated from a `FiberPool` (not shown yet).
 This is going to be done by a `FiberTask` under the hood.
 For now, we do everything manually:
@@ -1957,11 +1977,11 @@ void suspend()
 }
 ```
 
-So once `::SwitchToFiber()` returns - meaning other Fiber was running and we are resumed,
-we notify a user on a new `resume()`.
+So once `::SwitchToFiber()` returns - meaning other Fiber was
+running and we are resumed, we notify a user on a new `resume()`.
 
-Finally, to check that Fiber is doing something (either running or suspended from a user code),
-we expose next function:
+Finally, to check that Fiber is doing something (either running or suspended
+from within a user code), we expose next function:
 
 ``` cpp {.numberLines}
 bool is_busy() const
@@ -2107,7 +2127,7 @@ explicit FiberPool::FiberPool(std::size_t size) noexcept
 
 To create a Fiber is to invoke an `allocate()`. Note, we go as
 dumb and as simple as possible - doing linear search to find
-first free Fiber. It all could be made better, having basic freelist
+first free Fiber. It all could be made better, having basic free list
 allocator for indices as one way to go about it:
 
 ``` cpp {.numberLines}
@@ -2169,7 +2189,8 @@ int main()
 }
 ```
 
-Now, lets get rid of manually created MyFiberTask and make `FiberTask<T>` possible.
+Now, lets get rid of manually created MyFiberTask and make
+`FiberTask<T>` possible.
 
 ## FiberTask
 
@@ -2230,7 +2251,8 @@ everything is preallocated; meaning no allocations at runtime.
 
 For simpler implementation, we (a) bind Fiber lifetime to a Task lifetime:
 Fiber is released only when Task is destroyed; and (b) Task
-allocates on creation, going with more standard code for type-erased implementation.
+allocates on creation, going with more standard code for type-erased
+implementation.
 
 With this in mind, we start with FiberTask_Any:
 
@@ -2416,7 +2438,8 @@ struct FiberTask
         : _scheduler(&scheduler)
     {
         using TaskCallable = FiberTask_Callable<R, std::remove_cvref_t<C>>;
-        TaskCallable* task = new(std::nothrow) TaskCallable(std::forward<C>(callable), scheduler._fiber_pool);
+        TaskCallable* task = new(std::nothrow) TaskCallable(
+            std::forward<C>(callable), scheduler._fiber_pool);
         assert(task);
         scheduler.add_fiber_task(std::unique_ptr<FiberTask_Any>(task));
         _task = task;
@@ -2498,7 +2521,8 @@ bool FiberTaskScheduler::schedule_once()
             repeat |= task->is_completed();
             continue;
         }
-        auto it_remove = std::find(_tasks_to_remove.begin(), _tasks_to_remove.end(), task.get());
+        auto it_remove = std::find(_tasks_to_remove.begin()
+            , _tasks_to_remove.end(), task.get());
         if (it_remove == _tasks_to_remove.end())
         {
             continue;
