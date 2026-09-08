@@ -771,25 +771,25 @@ direct use of CURL_async_get().
 
 See App_Futures, App_Callbacks.
 
-# blocking, synchronous (App_Blocking) {#sync}
+# blocking, synchronous (App_Blocking) {#sync .unlisted .unnumbered}
 
-## on error handling {#error_handling}
+## on error handling {#error_handling .unlisted .unnumbered}
 
-### assume success always (tooling) {.unnumbered .unlisted}
-### implicit, return empty string {.unnumbered .unlisted}
-### status code, out parameter (std::filesystem-style) {.unnumbered .unlisted}
-### optional {.unnumbered .unlisted}
-### exceptions {.unnumbered .unlisted}
-### result/variant-like {.unnumbered .unlisted}
-### result/tuple-like {.unnumbered .unlisted}
-### result/specialized {.unnumbered .unlisted}
+### assume success always (tooling) {.unlisted .unnumbered}
+### implicit, return empty string {.unlisted .unnumbered}
+### status code, out parameter (std::filesystem-style) {.unlisted .unnumbered}
+### optional {.unlisted .unnumbered}
+### exceptions {.unlisted .unnumbered}
+### result/variant-like {.unlisted .unnumbered}
+### result/tuple-like {.unlisted .unnumbered}
+### result/specialized {.unlisted .unnumbered}
 
-# async polling, tasks  (App_Tasks)
-# blocking std::future/promise
-# async polling, std::future/promise
-# async, callbacks (App_Callbacks)
-# async, callbacks + polling (tasks, handle)
-# async with statefull/implicit callback (state.on_X.subscribe/delegates)
+# async polling, tasks  (App_Tasks) {.unlisted .unnumbered}
+# blocking std::future/promise {.unlisted .unnumbered}
+# async polling, std::future/promise {.unlisted .unnumbered}
+# async, callbacks (App_Callbacks) {.unlisted .unnumbered}
+# async, callbacks + polling (tasks, handle) {.unlisted .unnumbered}
+# async with statefull/implicit callback (state.on_X.subscribe/delegates) {.unlisted .unnumbered}
 
 # building C++20 coroutines API
 
@@ -1585,6 +1585,12 @@ struct promise_return<void>
     {
     }
 };
+
+template<typename T>
+struct promise_return<T&>
+{
+    static_assert(sizeof(T) == 0, "we do not support Co_Task<T&>");
+};
 ```
 
 promise_return for void injects `return_void()`, get() returns nothing.
@@ -1746,7 +1752,7 @@ struct Co_Task
     std::coroutine_handle<> await_suspend(std::coroutine_handle<> waiting_coro)
     {
         _coro.promise()._waiting_coro = waiting_coro;
-        return _coro;
+        return _coro; // resume us
     }
 
     co_handle _coro;
@@ -1767,7 +1773,7 @@ struct Co_Task
     [2] ... await_suspend(std::coroutine_handle<> waiting_coro)
     {
         _coro.promise()._waiting_coro = waiting_coro;
-        return _coro;
+        return _coro; // resume us
     }
     [3] co_handle _coro;
 };
@@ -1807,6 +1813,52 @@ That way coro_get() was scheduled to be executed because we co_await it from
 within coro_main() and coro_main() was executed 2nd time because coro_get() was
 completed.
 
+One note on the co_await semantic and ownership: see how for await_resume()
+we use `get_once()` to move the value out awaited task. In general, when
+co_awaiting, we consume the task and it can't be used after co_await. So the next
+code should be disallowed:
+
+``` cpp {.numberLines}
+static Co_Task<int> coro_main()
+{
+    Co_Task<int> t = coro_get(1);
+    co_await t; // t is lvalue
+    t.get(); // error
+}
+``` 
+
+To enforce that, we use `operator co_await() &&` with `&&` ref-qualifier; see also
+[C++ Coroutines: Understanding operator co_await](https://lewissbaker.github.io/2017/11/17/understanding-operator-co-await):
+
+``` cpp {.numberLines}
+struct Co_Await
+{
+    Co_Task<T> _task;
+
+    bool await_ready()
+    {
+        assert(_task.is_in_progress());
+        return false;
+    }
+    // intentionally auto, not decltype(auto)
+    auto await_resume()
+    {
+        return _task.get_once();
+    }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> waiting_coro)
+    {
+        _task._coro.promise()._waiting_coro = waiting_coro;
+        return _task._coro; // resume us
+    }
+};
+
+Co_Await operator co_await() &&
+{
+    // consume this.
+    return Co_Await{._task{std::move(*this)}};
+}
+```
+
 Now we can co_await our tasks multiple times:
 
 ``` cpp {.numberLines}
@@ -1836,15 +1888,186 @@ is still no way to launch those 2 coroutines concurrently and wait for both of t
 ``` cpp {.numberLines}
 static Co_Task<int> coro_main()
 {
-    auto [v1, v2] = co_await CO_wait_all(coro_get(2), coro_get(3));
+    auto [v1, v2] = co_await CO_await_all(coro_get(2), coro_get(3));
     co_return (v1 + v2);
 }
 ```
 
 ## waiting for multiple coroutines
 
+Lets implement awaiting for multiple Co_Tasks:
 
-# coroutines on top polling tasks
+``` cpp {.numberLines}
+static Co_Task<int> coro_main()
+{
+    auto [v1, v2] = co_await CO_await_all(coro_get(2), coro_get(3));
+    co_return (v1 + v2);
+}
+```
+
+Note how we return a tuple of all awaited results (since our coroutine task
+can never fail). Also, note how this is different to sequential co_await since
+all children coroutine tasks are started at the point of await and executed
+concurrently:
+
+``` cpp {.numberLines}
+static Co_Task<void> coro_main()
+{
+    int v1 = co_await coro_get(2);
+    int v2 = co_await coro_get(3); // runs strictly AFTER first task
+}
+```
+
+To await N tasks, our parent coroutine/task needs to be resumed only when last
+of that N tasks completes. To achieve this, we introduce a counter that signals
+how many tasks are still in progress. So our Final_Await can resume the parent
+only when the wait count is zero. See the old implementation:
+
+``` cpp {.numberLines}
+struct promise_type : promise_return<T>
+{
+    std::coroutine_handle<> _waiting_coro = std::noop_coroutine();
+
+    auto final_suspend() noexcept
+    {
+        struct Final_Await : std::suspend_always
+        {
+            std::coroutine_handle<> await_suspend(co_handle self_coro) noexcept
+            {
+                return self_coro.promise()._waiting_coro;
+            }
+        };
+        return Final_Await{};
+    }
+```
+
+and compare to a new one:
+
+``` cpp {.numberLines}
+struct promise_type : promise_return<T>
+{
+    std::int32_t* _wait_count = nullptr;
+    co_handle _waiting_coro;
+
+    std::coroutine_handle<> Final_Await::await_suspend(co_handle self_coro) noexcept
+    {
+        promise_type& self = self_coro.promise();
+        if (self._waiting_coro)
+        {
+            assert(self._wait_count);
+            std::int32_t& wait_count = *self._wait_count;
+            wait_count -= 1;
+            assert(wait_count >= 0);
+            if (wait_count == 0)
+            {
+                return self._waiting_coro;
+            }
+            // else: we are not the last task, do nothing.
+        }
+        // else: no one was awaiting us.
+        return std::noop_coroutine();
+    }
+```
+
+When Co_Task ends, we:
+
+1. check if someone waits for us
+2. decrement wait counter by 1
+3. see if we are the last one and resume awaiting coroutine
+
+With this change, awaiting a single Co_Task requires setting the counter:
+
+``` cpp {.numberLines}
+struct Co_Await
+{
+    Co_Task<T> _task;
+    std::int32_t _wait_count = 1;
+    std::coroutine_handle<> Co_Await::await_suspend(
+        std::coroutine_handle<> waiting_coro) noexcept
+    {
+        promise_type& promise = _task._coro.promise();
+        promise._wait_count = &_wait_count; // 1
+        promise._waiting_coro = waiting_coro;
+        return _task._coro; // resume us
+    }
+};
+```
+
+For awaiting of N coroutines/tasks, we start with `CO_await_all()`:
+
+``` cpp {.numberLines}
+template<typename... Ts>
+static auto CO_await_all(Co_Task<Ts>&&... tasks)
+{
+    static_assert(sizeof...(Ts) > 0);
+    using Is = std::index_sequence_for<Ts...>;
+    return Co_Await_All<Is, Ts...>{._tasks{std::move(tasks)...}};
+}
+```
+
+It accepts variadic number of any tasks, consumes all of them and returns an awaiter
+- Co_Await_All. We store all of the Co_Tasks and when wait completes, return a
+tuple of all of the results:
+
+``` cpp {.numberLines}
+template<auto... Is, typename... Ts>
+struct Co_Await_All<std::index_sequence<Is...>, Ts...>
+{
+    std::tuple<Co_Task<Ts>...> _tasks;
+    std::int32_t _wait_count = sizeof...(Ts);
+    bool await_ready()
+    {
+        // assert(_tasks[I].is_in_progress()...);
+        return false;
+    }
+    auto await_resume()
+    {
+        return std::tuple<Ts...>{std::get<Is>(_tasks).get_once()...};
+    }
+};
+```
+
+When awaiting starts, we (a) setup wait_count=N and (b) resume all of the tasks,
+also linking awaiting coroutine - as in the regular single-task await:
+
+``` cpp {.numberLines}
+void Co_Await_All::await_suspend(std::coroutine_handle<> waiting_coro)
+{
+    auto handle = [&](auto& Task)
+    {
+        auto& promise = Task._coro.promise();
+        promise._wait_count = &_wait_count;
+        promise._waiting_coro = waiting_coro;
+        Task._coro.resume();
+    };
+
+    (handle(std::get<Is>(_tasks)), ...);
+}
+```
+
+Finally, we can await several concurrently running Co_Tasks:
+
+``` cpp {.numberLines}
+static Co_Task<int> coro_get(int v)
+{
+    co_return v;
+}
+
+static Co_Task<int> coro_main()
+{
+    auto [v1, v2] = co_await CO_await_all(coro_get(2), coro_get(3));
+    co_return (v1 + v2);
+}
+
+int main()
+{
+    Co_Task<int> task = coro_main();
+    task.resume();
+    std::println("{}", task.get_once());
+}
+```
+
+# coroutines on top polling tasks {.unlisted .unnumbered}
 
 # building Fibers API
 
@@ -3001,7 +3224,7 @@ int main()
 }
 ```
 
-# fibers (WIN32) (App_Fibers)
+# fibers (WIN32) (App_Fibers) {.unlisted .unnumbered}
 # senders
 # reactive streams
 
