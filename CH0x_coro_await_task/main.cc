@@ -50,6 +50,8 @@ struct Co_Task
 
     struct promise_type : promise_return<T>
     {
+        std::coroutine_handle<> _waiting_coro = std::noop_coroutine();
+
         Co_Task get_return_object() noexcept
         {
             return Co_Task{co_handle::from_promise(*this)};
@@ -58,9 +60,16 @@ struct Co_Task
         {
             return {};
         }
-        std::suspend_always final_suspend() noexcept
+        auto final_suspend() noexcept
         {
-            return {};
+            struct Final_Await : std::suspend_always
+            {
+                std::coroutine_handle<> await_suspend(co_handle self_coro) noexcept
+                {
+                    return self_coro.promise()._waiting_coro;
+                }
+            };
+            return Final_Await{};
         }
         void unhandled_exception() noexcept
         {
@@ -109,12 +118,35 @@ struct Co_Task
         return _coro.promise().get_once();
     }
 
+    bool await_ready()
+    {
+        assert(is_in_progress());
+        return false;
+    }
+    // intentionally auto, not decltype(auto)
+    auto await_resume()
+    {
+        return get_once();
+    }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> waiting_coro)
+    {
+        _coro.promise()._waiting_coro = waiting_coro;
+        return _coro;
+    }
+
     co_handle _coro;
 };
 
+static Co_Task<int> coro_get(int v)
+{
+    co_return v;
+}
+
 static Co_Task<int> coro_main()
 {
-    co_return 3;
+    const int v1 = co_await coro_get(2);
+    const int v2 = co_await coro_get(3);
+    co_return (v1 + v2);
 }
 
 int main()

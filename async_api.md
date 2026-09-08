@@ -837,7 +837,7 @@ Lets start with basics.
 
 ## C++ coroutines, basic task type
 
-CODE: CH0x_coro_task
+CODE: CH0x_coro_basic_task
 
 There is a trick to writing some basic C++20 coroutines code - **listen to the
 compiler**. Lets see what it takes to make the next code "work":
@@ -862,14 +862,14 @@ Co_Task coro_work()
 
 MSVC complains:
 
-```
+``` {.numberLines}
 main.cc(164,5): error C3774: cannot find 'std::coroutine_traits':
                 Please include <coroutine> header
 ```
 
 after including `<coroutine>` header:
 
-```
+``` {.numberLines}
 main.cc(166,5): error C2039: 'promise_type': is not a member of
                 'std::coroutine_traits<Co_Task>'
 ```
@@ -892,7 +892,7 @@ Co_Task coro_work()
 
 MSVC complains:
 
-```
+``` {.numberLines}
 main.cc(170,1): error C3789: this function cannot be a coroutine:
                 'Co_Task::promise_type' does not declare the member
                 'get_return_object()'
@@ -931,7 +931,7 @@ Co_Task coro_work()
 
 MSVC complains:
 
-```
+``` {.numberLines}
 main.cc(164,12): error C3781: Co_Task::promise_type: a coroutine's
                  promise must declare either
                  'return_value' or 'return_void'
@@ -955,7 +955,7 @@ struct promise_type
 
 MSVC complains:
 
-```
+``` {.numberLines}
 main.cc(168,29): error C5231: the expression
                  'co_await promise.final_suspend()' must be non-throwing
 ```
@@ -1123,7 +1123,7 @@ inside coro_work
 
 ## C++ coroutines, basic await
 
-CODE: CH0x_coro_await
+CODE: CH0x_coro_basic_await
 
 Given that we can have simplest coroutine, what does it take to co_await?
 Lets try to compile:
@@ -1140,7 +1140,7 @@ Co_Task coro_work()
 
 MSVC complains:
 
-```
+``` {.numberLines}
 main.cc(73,26): error C2039: 'await_ready': is not a member of 'Co_CurlAsync'
 main.cc(73,26): error C2039: 'await_suspend': is not a member of 'Co_CurlAsync'
 main.cc(70,26): error C2039: 'await_resume': is not a member of 'Co_CurlAsync'
@@ -1370,7 +1370,7 @@ we can't do (since, otherwise, the interface is more advanced).
 4th solution is the most inefficient and requires no changes neither in Co_Task
 nor in callback API.
 
-## C++ coroutines, await callback (no crash)
+## C++ coroutines, await callback
 
 CODE: CH0x_coro_curl
 
@@ -1495,6 +1495,354 @@ optimizations and limitations, this number of allocations can go down to amortiz
  * CURL scheduler preallocates up to N max requests
  * request itself knows how to store the response and coroutine-callback inline
  * coroutine itself re-uses memory pool for up to N max active coroutines.
+
+Anyway, we now can co-await requests with a nice syntax:
+
+``` cpp {.numberLines}
+static Co_Task coro_main(CURL_Async curl_async)
+{
+    const std::string r1 = co_await CURL_await_get(
+        curl_async, "localhost:5001/file1.txt");
+    const std::string r2 = co_await CURL_await_get(
+        curl_async, "localhost:5001/file2.txt");
+    std::println("{}", r1);
+    std::println("{}", r2);
+    co_return;
+}
+
+int main()
+{
+    CURL_Async curl_async = CURL_async_create();
+    Co_Task task = coro_main(curl_async);
+    task.resume();
+    while (task.is_in_progress())
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+Note, however, we run 2 requests one after another: second request starts
+when first co_await ends. There is no concurrency..
+
+## coroutine task that holds a return value
+
+CODE: CH0x_coro_task
+
+To be more useful, we'd like to be able return something out of coroutine:
+
+``` cpp {.numberLines}
+static Co_Task<int> coro_main()
+{
+    co_return 3;
+}
+
+int main()
+{
+    Co_Task<int> task = coro_main();
+    task.resume();
+    std::println("coro main: {}", task.get_once());
+}
+```
+
+It requires implementing promise_type `return_value()` and `return_void()`
+customization points. The only complication is that we need to handle
+`Co_Task<void>`. To do so, lets start with `promise_return<T>`:
+
+``` cpp {.numberLines}
+template<typename T>
+struct promise_return
+{
+    std::variant<std::monostate, T> _value;
+    template<typename U>
+    void return_value(U&& v) noexcept
+    {
+        _value.template emplace<1>(std::forward<U>(v));
+    }
+    const T& get() const noexcept
+    {
+        assert(_value.index() == 1);
+        return std::get<1>(_value);
+    }
+    T&& get_once() noexcept
+    {
+        const T& v = static_cast<const promise_return&>(*this).get();
+        return std::move(const_cast<T&>(v));
+    }
+};
+
+template<>
+struct promise_return<void>
+{
+    void return_void() noexcept
+    {
+    }
+    void get() const noexcept
+    {
+    }
+    void get_once() noexcept
+    {
+    }
+};
+```
+
+promise_return for void injects `return_void()`, get() returns nothing.
+promise_return for any type T injects `return_value()` and remembers the value.
+std::variant is used to handle non-default-constructible types and, in general,
+construct a value only at the point of the actual return/co_return.
+
+With the help of promise_return, promise_type remains the same as our initial
+version:
+
+``` cpp {.numberLines}
+template<typename T>
+struct Co_Task
+{
+    struct promise_type;
+    using co_handle = std::coroutine_handle<promise_type>;
+
+    struct promise_type : promise_return<T>
+    {
+        Co_Task get_return_object() noexcept
+        {
+            return Co_Task{co_handle::from_promise(*this)};
+        }
+        std::suspend_always initial_suspend() noexcept
+        {
+            return {};
+        }
+        std::suspend_always final_suspend() noexcept
+        {
+            return {};
+        }
+        void unhandled_exception() noexcept
+        {
+            // crash, no exceptions handling
+            assert(false);
+        }
+    };
+
+    // ...
+    decltype(auto) get() const
+    {
+        assert(_coro);
+        return _coro.promise().get();
+    }
+    decltype(auto) get_once() const
+    {
+        assert(_coro);
+        return _coro.promise().get_once();
+    }
+
+    co_handle _coro;
+};
+```
+
+Now `Co_Task<T>` works:
+
+``` cpp {.numberLines}
+static Co_Task<int> coro_main()
+{
+    co_return 3;
+}
+```
+
+## awaiting coroutine task
+
+CODE: CH0x_coro_await_task
+
+Now, given `Co_Task<T>`, we need to await for it somehow:
+
+``` cpp {.numberLines}
+static Co_Task<int> coro_get()
+{
+    co_return 3;
+}
+
+static Co_Task<int> coro_main()
+{
+    const int v = co_await coro_get();
+    co_return v;
+}
+```
+
+There are 2 important implementation bits to know:
+
+ - [Symmetric Transfer](https://lewissbaker.github.io/2020/05/11/understanding_symmetric_transfer)
+ - final_suspend() can return **custom** awaitable
+
+`final_suspend()` allows to inject custom code for the moment of coroutine END, so
+we can do something at that point in time:
+
+``` cpp {.numberLines}
+struct promise_type : promise_return<T>
+{
+    auto final_suspend() noexcept
+    {
+        struct Final_Await : std::suspend_always
+        {
+            void await_suspend(co_handle self_coro) noexcept
+            {
+                // **HERE**
+            }
+        };
+        return Final_Await{};
+    }
+```
+
+Given a simple coroutine:
+
+``` cpp {.numberLines}
+static Co_Task<int> coro_get()
+{
+    co_return 3;
+} // <-- final_suspend()
+```
+
+our Final_Await, await_suspend() gets invoked after co_return,
+passing a coroutine that is about to end. This is exactly what we need to
+notify some other waiting code that we are done. We could invoke a callback... BUT
+with a symmetric transfer, `await_suspend()` can return a **next** coroutine that
+must be executed:
+
+``` cpp {.numberLines}
+struct promise_type : promise_return<T>
+{
+    std::coroutine_handle<> _waiting_coro = std::noop_coroutine();
+
+    auto final_suspend() noexcept
+    {
+        struct Final_Await : std::suspend_always
+        {
+            std::coroutine_handle<> await_suspend(co_handle self_coro) noexcept
+            {
+                return self_coro.promise()._waiting_coro;
+            }
+        };
+        return Final_Await{};
+    }
+```
+
+Here, if no one waits for us, we return `std::noop_coroutine()` that does nothing.
+Otherwise, if `_waiting_coro` was set, we end the execution of our coroutine
+and resume any other coroutine that was waiting for us. To setup `_waiting_coro`,
+we implement awaitable interface for Co_Task itself:
+
+``` cpp {.numberLines}
+template<typename T>
+struct Co_Task
+{
+    bool await_ready()
+    {
+        assert(is_in_progress());
+        return false;
+    }
+    // intentionally auto, not decltype(auto)
+    auto await_resume()
+    {
+        return get_once();
+    }
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<> waiting_coro)
+    {
+        _coro.promise()._waiting_coro = waiting_coro;
+        return _coro;
+    }
+
+    co_handle _coro;
+};
+```
+
+It's important to understand what is `_coro` and what is `waiting_coro`.
+We have 3 moving parts (1) Final_Await::await_suspend() with self_coro,
+(2) Co_Task::await_suspend() waiting_coro and (3) Co_Task `_coro` member itself:
+
+``` cpp {.numberLines}
+struct Co_Task
+{
+    [1] ... promise_type::Final_Await::await_suspend(co_handle self_coro) noexcept
+    {
+        return self_coro.promise()._waiting_coro;
+    }
+    [2] ... await_suspend(std::coroutine_handle<> waiting_coro)
+    {
+        _coro.promise()._waiting_coro = waiting_coro;
+        return _coro;
+    }
+    [3] co_handle _coro;
+};
+```
+
+Given our awaiting code sample:
+
+``` cpp {.numberLines}
+static Co_Task<int> coro_get()
+{
+    co_return 3;
+}
+
+static Co_Task<int> coro_main()
+{
+    co_return co_await coro_get();
+}
+```
+
+We have 2 coroutines created, where:
+
+1. `_coro` from part [3] is `coro_get()`
+2. `waiting_coro` from part [2] await_suspend() is our `coro_main()`; and
+3. `self_coro` from part [1] is `coro_get()` again that gets finished.
+
+So, we
+
+1. create coro_main()
+2. create coro_get()
+3. then await_suspend() on coro_get() from within coro_main()
+4. that remembers that `_waiting_coro` is coro_main()
+5. resumes coro_get() execution (by returning it, symmetric transfer); and then
+5. we finish coro_get() and its final_suspend() resumes `_waiting_coro`
+   which is coro_main().
+
+That way coro_get() was scheduled to be executed because we co_await it from
+within coro_main() and coro_main() was executed 2nd time because coro_get() was
+completed.
+
+Now we can co_await our tasks multiple times:
+
+``` cpp {.numberLines}
+static Co_Task<int> coro_get(int v)
+{
+    co_return v;
+}
+
+static Co_Task<int> coro_main()
+{
+    const int v1 = co_await coro_get(2);
+    const int v2 = co_await coro_get(3);
+    co_return (v1 + v2);
+}
+
+int main()
+{
+    Co_Task<int> task = coro_main();
+    task.resume();
+    std::println("coro main: {}", task.get_once());
+}
+```
+
+Note, how we still execute `coro_get(2)` first then `coro_get(3)` second. There
+is still no way to launch those 2 coroutines concurrently and wait for both of them:
+
+``` cpp {.numberLines}
+static Co_Task<int> coro_main()
+{
+    auto [v1, v2] = co_await CO_wait_all(coro_get(2), coro_get(3));
+    co_return (v1 + v2);
+}
+```
+
+## waiting for multiple coroutines
+
 
 # coroutines on top polling tasks
 
