@@ -11,7 +11,7 @@ include-before: |
     deliberately simple, while still presenting as much details as possible.
 
     Jump to examples for [blocking](#app_blocking), [callbacks](#app_callbacks),
-    tasks, std::future, coroutines, fibers, senders code.
+    tasks, std::future, [coroutines](#app_coroutines), fibers, senders code.
 
     [Work In Progress]{.mark}.
 
@@ -3486,8 +3486,8 @@ CODE: App_Callbacks
 
 With callbacks API, there are 2 variations:
 
-1. doing 2 requests concurrently: see `App00_Callbacks()`
-2. doing 2 requests one after another: see `App01_Callbacks()`
+1. doing 2 requests one after another: see `App01_Callbacks()`
+2. doing 2 requests concurrently: see `App00_Callbacks()`
 
 ``` cpp {.numberLines}
 int main()
@@ -3498,6 +3498,66 @@ int main()
 ```
 
 All the other sections have the same naming convention and the same main().
+
+2 requests one after another:
+
+``` cpp {.numberLines}
+struct App01_State
+{
+    CURL_Async _curl_async{};
+    bool _finished = false;
+    std::string _r1;
+    std::string _r2;
+
+    explicit App01_State(CURL_Async curl_async) noexcept
+        : _curl_async(curl_async)
+    {
+    }
+    App01_State(const App01_State&) = delete;
+    ~App01_State() noexcept
+    {
+        assert(_finished);
+    }
+
+    void start()
+    {
+        CURL_async_get(_curl_async, "localhost:5001/file1.txt", this
+            , [](void* user_data, std::string response1)
+        {
+            App01_State& state = *static_cast<App01_State*>(user_data);
+            state._r1 = std::move(response1);
+
+            CURL_async_get(state._curl_async, "localhost:5001/file2.txt", user_data
+                , [](void* user_data, std::string response2)
+            {
+                App01_State& state = *static_cast<App01_State*>(user_data);
+                state._r2 = std::move(response2);
+                state._finished = true;
+                state.done();
+            });
+        });
+    }
+
+    void done()
+    {
+        assert(_finished);
+        std::println("{}", _r1);
+        std::println("{}", _r2);
+    }
+};
+
+static void App01_Callbacks()
+{
+    CURL_Async curl_async = CURL_async_create();
+    App01_State app{curl_async};
+    app.start();
+    while (!app._finished)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
 
 2 concurrent requests:
 
@@ -3571,59 +3631,53 @@ static void App00_Callbacks()
 }
 ```
 
+## requests with coroutines {#app_coroutines}
+
 2 requests one after another:
 
 ``` cpp {.numberLines}
-struct App01_State
+static Co_Task<void> App01_Run(CURL_Async curl_async)
 {
-    CURL_Async _curl_async{};
-    bool _finished = false;
-    std::string _r1;
-    std::string _r2;
+    const std::string r1 = co_await CURL_await_get(curl_async, "localhost:5001/file1.txt");
+    const std::string r2 = co_await CURL_await_get(curl_async, "localhost:5001/file2.txt");
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
 
-    explicit App01_State(CURL_Async curl_async) noexcept
-        : _curl_async(curl_async)
-    {
-    }
-    App01_State(const App01_State&) = delete;
-    ~App01_State() noexcept
-    {
-        assert(_finished);
-    }
-
-    void start()
-    {
-        CURL_async_get(_curl_async, "localhost:5001/file1.txt", this
-            , [](void* user_data, std::string response1)
-        {
-            App01_State& state = *static_cast<App01_State*>(user_data);
-            state._r1 = std::move(response1);
-
-            CURL_async_get(state._curl_async, "localhost:5001/file2.txt", user_data
-                , [](void* user_data, std::string response2)
-            {
-                App01_State& state = *static_cast<App01_State*>(user_data);
-                state._r2 = std::move(response2);
-                state._finished = true;
-                state.done();
-            });
-        });
-    }
-
-    void done()
-    {
-        assert(_finished);
-        std::println("{}", _r1);
-        std::println("{}", _r2);
-    }
-};
-
-static void App01_Callbacks()
+static void App01_Coroutines()
 {
     CURL_Async curl_async = CURL_async_create();
-    App01_State app{curl_async};
-    app.start();
-    while (!app._finished)
+    Co_Task task = App01_Run(curl_async);
+    task.resume();
+    while (task.is_in_progress())
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+main() loop takes a bit of space, but the actual business logic is almost the
+same as regular synchronous code.
+
+2 concurrent requests:
+
+``` cpp {.numberLines}
+static Co_Task<void> App00_Run(CURL_Async curl_async)
+{
+    auto [r1, r2] = co_await CO_await_all(
+        CURL_coro_get(curl_async, "localhost:5001/file1.txt"),
+        CURL_coro_get(curl_async, "localhost:5001/file2.txt"));
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
+
+static void App00_Coroutines()
+{
+    CURL_Async curl_async = CURL_async_create();
+    Co_Task task = App00_Run(curl_async);
+    task.resume();
+    while (task.is_in_progress())
     {
         CURL_async_tick(curl_async);
     }
