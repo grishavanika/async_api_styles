@@ -2068,6 +2068,234 @@ int main()
 }
 ```
 
+## waiting for multiple CURL requests with tasks
+
+CODE: CH0x_coro_await_curl
+
+We already built CURL_await_get() that awaits CURL request within a coroutine.
+With CO_await_all() API, we can await for multiple concurrent CURL requests
+by wrapping every request into a separate coroutine task:
+
+``` cpp {.numberLines}
+Co_Task<std::string> CURL_coro_get(CURL_Async curl_async, std::string url)
+{
+    co_return co_await CURL_await_get(curl_async, url);
+}
+
+Co_Task<void> coro_main(CURL_Async curl_async)
+{
+    auto [r1, r2] = co_await CO_await_all(
+        CURL_coro_get(curl_async, "localhost:5001/file1.txt"),
+        CURL_coro_get(curl_async, "localhost:5001/file2.txt"),
+        );
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
+```
+
+That's.. all. Note, however, 3 separate coroutines are allocated (one for coro_main
+and two for CURL_coro_get). We can do less generic coroutine awaiter that skips
+intermediate coroutines.
+
+## waiting for multiple CURL request with custom awaitable
+
+CODE: CH0x_coro_await_many
+
+Instead of CURL_coro_get() + CO_await_all():
+
+``` cpp {.numberLines}
+Co_Task<std::string> CURL_coro_get(CURL_Async curl_async, std::string url)
+{
+    co_return co_await CURL_await_get(curl_async, url);
+}
+// ...
+auto [r1, r2] = co_await CO_await_all(
+    CURL_coro_get(curl_async, "localhost:5001/file1.txt"),
+    CURL_coro_get(curl_async, "localhost:5001/file2.txt"),
+    );
+```
+
+we can make a separate, specialized awaiter, like CURL_await_get_many():
+
+``` cpp {.numberLines}
+auto [r1, r2] = co_await CURL_await_get_many(curl_async,
+    "localhost:5001/file1.txt",
+    "localhost:5001/file2.txt"
+    );
+```
+
+that skips intermediate CURL_coro_get() coroutine.
+
+CURL_await_get_many() is almost the same as CURL_await_get() implementation:
+
+``` cpp {.numberLines}
+template<typename... URLs>
+    requires std::conjunction_v<
+        std::is_constructible<std::string, URLs&&>...>
+auto CURL_await_get_many(CURL_Async curl_async, URLs... urls)
+{
+    Co_CurlAsyncMany<std::index_sequence_for<URLs...>> awaiter;
+    awaiter._curl_async = curl_async;
+    awaiter.setup_urls(std::move(urls)...);
+    return awaiter;
+}
+```
+
+Ignoring templates (to be able to accept variadic number of URLs), we create
+Co_CurlAsyncMany awaitable that knows how to wait for N requests:
+
+``` cpp {.numberLines}
+template<typename Is>
+struct Co_CurlAsyncMany;
+
+template<auto... Is>
+struct Co_CurlAsyncMany<std::index_sequence<Is...>>
+{
+    struct WaitState
+    {
+        std::int32_t _active_count = 0;
+        Co_CurlAsyncMany* _self = nullptr;
+    };
+
+    static constexpr std::size_t Count = sizeof...(Is);
+    CURL_Async _curl_async{};
+    std::coroutine_handle<> _coro;
+
+    WaitState* _wait_state = nullptr;
+    std::array<std::string, Count> _urls;
+    std::array<std::string, Count> _responses;
+
+    template<typename... URLs>
+    void setup_urls(URLs... urls)
+    {
+        ((_urls[Is] = std::move(urls)), ...);
+    }
+
+    // ...
+};
+```
+
+Here, we remember all of URLs and have an `std::array<std::string, Count>` for
+all of responses. Our WaitState passed to CURL_async_get() callback
+also has a counter for active requests since we want
+to complete only when last request is finished:
+
+``` cpp {.numberLines}
+bool Co_CurlAsyncMany::await_ready() noexcept
+{
+    return false;
+}
+
+void Co_CurlAsyncMany::await_suspend(std::coroutine_handle<> coro) noexcept
+{
+    _coro = coro;
+    _wait_state = new(std::nothrow) WaitState;
+    assert(_wait_state);
+    _wait_state->_active_count = Count;
+    _wait_state->_self = this;
+
+    auto handle = [&]<auto I>(std::integral_constant<std::size_t, I>)
+    {
+        CURL_async_get(_curl_async, _urls[I]
+            , _wait_state
+            , [](void* user_data, std::string response)
+        {
+            WaitState* wait_state = static_cast<WaitState*>(user_data);
+            assert(wait_state);
+            if (on_response<I>(*wait_state, std::move(response)))
+            {
+                delete wait_state;
+            }
+        });
+    };
+
+    (handle(std::integral_constant<std::size_t, Is>{}), ...);
+}
+
+Co_CurlAsyncMany::~Co_CurlAsyncMany() noexcept
+{
+    if (_wait_state)
+    {
+        assert(_wait_state->_self == this);
+        _wait_state->_self = nullptr; // dead
+    }
+}
+
+std::array<std::string, Count> Co_CurlAsyncMany::await_resume() noexcept
+{
+    return std::move(_responses);
+}
+```
+
+Basically, we:
+
+1. start N requests; and
+2. clean-up `wait_state` only for a last response
+3. wait_state logic/lifetime handling is the same as is for Co_CurlAsync
+
+Finally, `on_response<I>()` is also largely the same as Co_CurlAsync:
+(a) we decrement active requests count, (b) see if coroutine is still alive,
+(c) write a response to proper place and (c) resume awaiting coroutine
+if we are the last response:
+
+``` cpp {.numberLines}
+template<auto I>
+static bool Co_CurlAsyncMany::on_response(
+    WaitState& wait_state, std::string&& response)
+{
+    wait_state._active_count -= 1;
+    assert(wait_state._active_count >= 0);
+
+    if (wait_state._self)
+    {
+        Co_CurlAsyncMany& self = *wait_state._self;
+        self._responses[I] = std::move(response);
+        if (wait_state._active_count == 0)
+        {
+            self._wait_state = nullptr;
+            self._coro.resume();
+        }
+    }
+    // else: Co_CurlAsyncMany/coroutine is dead
+
+    if (wait_state._active_count == 0)
+    {
+        return true; // done
+    }
+    return false;
+}
+```
+
+With that in mind, we can do:
+
+``` cpp {.numberLines}
+Co_Task<void> coro_main(CURL_Async curl_async)
+{
+    auto [r1, r2] = co_await CURL_await_get_many(curl_async,
+        "localhost:5001/file1.txt",
+        "localhost:5001/file2.txt"
+        );
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
+```
+
+which is slightly different to a more generic version:
+
+``` cpp {.numberLines}
+Co_Task<void> coro_main(CURL_Async curl_async)
+{
+    auto [r1, r2] = co_await CO_await_all(
+        CURL_coro_get(curl_async, "localhost:5001/file1.txt"),
+        CURL_coro_get(curl_async, "localhost:5001/file2.txt"),
+        );
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
+```
+
+For the rest of the sample code, we'll go using `CO_await_all()` version.
+
 # coroutines on top polling tasks {.unlisted .unnumbered}
 
 # building Fibers API

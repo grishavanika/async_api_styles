@@ -173,9 +173,6 @@ struct Co_Task
     co_handle _coro;
 };
 
-template<typename T>
-struct S;
-
 template<typename Is, typename... Ts>
 struct Co_Await_All;
 
