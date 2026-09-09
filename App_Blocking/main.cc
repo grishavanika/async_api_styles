@@ -46,8 +46,16 @@ std::string CURL_get(const std::string& url)
     return response;
 }
 
+///////////////////////////////////////////////////////////
+static void App01_Blocking()
+{
+    const std::string r1 = CURL_get("localhost:5001/file1.txt");
+    const std::string r2 = CURL_get("localhost:5001/file2.txt");
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
+
 int main()
 {
-    const std::string r = CURL_get("localhost:5001/file1.txt");
-    std::println("CURL_get(file1.txt): '{}'", r);
+    App01_Blocking();
 }

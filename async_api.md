@@ -10,7 +10,8 @@ include-before: |
     of coroutines or fibers with multithreading. Some parts are
     deliberately simple, while still presenting as much details as possible.
 
-    Jump to tasks, std::future, coroutines, fibers, senders. TODO: App_X.
+    Jump to examples for [blocking](#app_blocking), [callbacks](#app_callbacks),
+    tasks, std::future, coroutines, fibers, senders code.
 
     [Work In Progress]{.mark}.
 
@@ -3228,3 +3229,176 @@ int main()
 # senders
 # reactive streams
 
+# SAMPLES
+
+## synchronous requests {#app_blocking}
+
+CODE: App_Blocking
+
+For completeness, our trivial case - doing 2 GET requests one after another:
+
+``` cpp {.numberLines}
+static void App01_Blocking()
+{
+    const std::string r1 = CURL_get("localhost:5001/file1.txt");
+    const std::string r2 = CURL_get("localhost:5001/file2.txt");
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
+
+int main()
+{
+    App01_Blocking();
+}
+```
+
+## requests with callbacks {#app_callbacks}
+
+CODE: App_Callbacks
+
+With callbacks API, there are 2 variations:
+
+1. doing 2 requests concurrently: see `App00_Callbacks()`
+2. doing 2 requests one after another: see `App01_Callbacks()`
+
+``` cpp {.numberLines}
+int main()
+{
+    App00_Callbacks();
+    App01_Callbacks();
+}
+```
+
+All the other sections have the same naming convention and the same main().
+
+2 concurrent requests:
+
+``` cpp {.numberLines}
+struct App00_State
+{
+    CURL_Async _curl_async{};
+    std::int32_t _requests = 0;
+    bool _finished = false;
+    std::string _r1;
+    std::string _r2;
+
+    explicit App00_State(CURL_Async curl_async) noexcept
+        : _curl_async(curl_async)
+    {
+    }
+    App00_State(const App00_State&) = delete;
+    ~App00_State() noexcept
+    {
+        assert(_finished);
+    }
+
+    void start()
+    {
+        _requests = 2;
+        CURL_async_get(_curl_async, "localhost:5001/file1.txt", this
+            , [](void* user_data, std::string response)
+        {
+            App00_State& state = *static_cast<App00_State*>(user_data);
+            state._r1 = std::move(response);
+            state.try_finish();
+        });
+        CURL_async_get(_curl_async, "localhost:5001/file2.txt", this
+            , [](void* user_data, std::string response)
+        {
+            App00_State& state = *static_cast<App00_State*>(user_data);
+            state._r2 = std::move(response);
+            state.try_finish();
+        });
+    }
+
+    void try_finish()
+    {
+        assert(_requests > 0);
+        _requests -= 1;
+        if (_requests == 0)
+        {
+            _finished = true;
+            done();
+        }
+    }
+
+    void done()
+    {
+        assert(_finished);
+        std::println("{}", _r1);
+        std::println("{}", _r2);
+    }
+};
+
+static void App00_Callbacks()
+{
+    CURL_Async curl_async = CURL_async_create();
+    App00_State app{curl_async};
+    app.start();
+    while (!app._finished)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+2 requests one after another:
+
+``` cpp {.numberLines}
+struct App01_State
+{
+    CURL_Async _curl_async{};
+    bool _finished = false;
+    std::string _r1;
+    std::string _r2;
+
+    explicit App01_State(CURL_Async curl_async) noexcept
+        : _curl_async(curl_async)
+    {
+    }
+    App01_State(const App01_State&) = delete;
+    ~App01_State() noexcept
+    {
+        assert(_finished);
+    }
+
+    void start()
+    {
+        CURL_async_get(_curl_async, "localhost:5001/file1.txt", this
+            , [](void* user_data, std::string response1)
+        {
+            App01_State& state = *static_cast<App01_State*>(user_data);
+            state._r1 = std::move(response1);
+
+            CURL_async_get(state._curl_async, "localhost:5001/file2.txt", user_data
+                , [](void* user_data, std::string response2)
+            {
+                App01_State& state = *static_cast<App01_State*>(user_data);
+                state._r2 = std::move(response2);
+                state._finished = true;
+                state.done();
+            });
+        });
+    }
+
+    void done()
+    {
+        assert(_finished);
+        std::println("{}", _r1);
+        std::println("{}", _r2);
+    }
+};
+
+static void App01_Callbacks()
+{
+    CURL_Async curl_async = CURL_async_create();
+    App01_State app{curl_async};
+    app.start();
+    while (!app._finished)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```

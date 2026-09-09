@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 project(ASYNC_API LANGUAGES CXX)
 
+add_subdirectory(App_Blocking)
+add_subdirectory(App_Callbacks)
 add_subdirectory(CH00_cmake)
 add_subdirectory(CH0x_coro_await_all)
 add_subdirectory(CH0x_coro_await_task)

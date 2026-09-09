@@ -158,27 +158,134 @@ void CURL_async_get(CURL_Async curl_async
     });
 }
 
-int main()
+///////////////////////////////////////////////////////////
+struct App00_State
 {
-    struct State
+    CURL_Async _curl_async{};
+    std::int32_t _requests = 0;
+    bool _finished = false;
+    std::string _r1;
+    std::string _r2;
+
+    explicit App00_State(CURL_Async curl_async) noexcept
+        : _curl_async(curl_async)
     {
-        std::string response;
-        bool done = false;
-    };
+    }
+    App00_State(const App00_State&) = delete;
+    ~App00_State() noexcept
+    {
+        assert(_finished);
+    }
+
+    void start()
+    {
+        _requests = 2;
+        CURL_async_get(_curl_async, "localhost:5001/file1.txt", this
+            , [](void* user_data, std::string response)
+        {
+            App00_State& state = *static_cast<App00_State*>(user_data);
+            state._r1 = std::move(response);
+            state.try_finish();
+        });
+        CURL_async_get(_curl_async, "localhost:5001/file2.txt", this
+            , [](void* user_data, std::string response)
+        {
+            App00_State& state = *static_cast<App00_State*>(user_data);
+            state._r2 = std::move(response);
+            state.try_finish();
+        });
+    }
+
+    void try_finish()
+    {
+        assert(_requests > 0);
+        _requests -= 1;
+        if (_requests == 0)
+        {
+            _finished = true;
+            done();
+        }
+    }
+
+    void done()
+    {
+        assert(_finished);
+        std::println("{}", _r1);
+        std::println("{}", _r2);
+    }
+};
+
+static void App00_Callbacks()
+{
     CURL_Async curl_async = CURL_async_create();
-    State state;
-    CURL_async_get(curl_async, "localhost:5001/file1.txt", &state
-        , [](void* user_data, std::string response)
-    {
-        State& state_ = *static_cast<State*>(user_data);
-        state_.response = std::move(response);
-        state_.done = true;
-    });
-    while (!state.done)
+    App00_State app{curl_async};
+    app.start();
+    while (!app._finished)
     {
         CURL_async_tick(curl_async);
     }
     CURL_async_destroy(curl_async);
+}
 
-    std::println("async response: '{}'", state.response);
+///////////////////////////////////////////////////////////
+struct App01_State
+{
+    CURL_Async _curl_async{};
+    bool _finished = false;
+    std::string _r1;
+    std::string _r2;
+
+    explicit App01_State(CURL_Async curl_async) noexcept
+        : _curl_async(curl_async)
+    {
+    }
+    App01_State(const App01_State&) = delete;
+    ~App01_State() noexcept
+    {
+        assert(_finished);
+    }
+
+    void start()
+    {
+        CURL_async_get(_curl_async, "localhost:5001/file1.txt", this
+            , [](void* user_data, std::string response1)
+        {
+            App01_State& state = *static_cast<App01_State*>(user_data);
+            state._r1 = std::move(response1);
+
+            CURL_async_get(state._curl_async, "localhost:5001/file2.txt", user_data
+                , [](void* user_data, std::string response2)
+            {
+                App01_State& state = *static_cast<App01_State*>(user_data);
+                state._r2 = std::move(response2);
+                state._finished = true;
+                state.done();
+            });
+        });
+    }
+
+    void done()
+    {
+        assert(_finished);
+        std::println("{}", _r1);
+        std::println("{}", _r2);
+    }
+};
+
+static void App01_Callbacks()
+{
+    CURL_Async curl_async = CURL_async_create();
+    App01_State app{curl_async};
+    app.start();
+    while (!app._finished)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+
+int main()
+{
+    App00_Callbacks();
+    App01_Callbacks();
 }

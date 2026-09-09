@@ -155,7 +155,7 @@ void CURL_async_get(CURL_Async curl_async
         long response_code = -1;
         const CURLcode status_ = curl_easy_getinfo(curl_easy_, CURLINFO_RESPONSE_CODE, &response_code);
         assert(status_ == CURLE_OK);
-        assert(response_code == 200L);
+        assert(response_code == 200L && "RUN serve.cmd");
         curl_easy_cleanup(curl_easy_);
         std::string data = std::move(*state);
         delete state;
