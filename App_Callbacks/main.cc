@@ -159,7 +159,64 @@ void CURL_async_get(CURL_Async curl_async
 }
 
 ///////////////////////////////////////////////////////////
-struct App00_State
+struct App_StateV0 // sequential
+{
+    CURL_Async _curl_async{};
+    bool _finished = false;
+    std::string _r1;
+    std::string _r2;
+
+    explicit App_StateV0(CURL_Async curl_async) noexcept
+        : _curl_async(curl_async)
+    {
+    }
+    App_StateV0(const App_StateV0&) = delete;
+    ~App_StateV0() noexcept
+    {
+        assert(_finished);
+    }
+
+    void start()
+    {
+        CURL_async_get(_curl_async, "localhost:5001/file1.txt", this
+            , [](void* user_data, std::string response1)
+        {
+            App_StateV0& state = *static_cast<App_StateV0*>(user_data);
+            state._r1 = std::move(response1);
+
+            CURL_async_get(state._curl_async, "localhost:5001/file2.txt", user_data
+                , [](void* user_data, std::string response2)
+            {
+                App_StateV0& state = *static_cast<App_StateV0*>(user_data);
+                state._r2 = std::move(response2);
+                state._finished = true;
+                state.done();
+            });
+        });
+    }
+
+    void done()
+    {
+        assert(_finished);
+        std::println("{}", _r1);
+        std::println("{}", _r2);
+    }
+};
+
+static void App_CallbacksV0()
+{
+    CURL_Async curl_async = CURL_async_create();
+    App_StateV0 app{curl_async};
+    app.start();
+    while (!app._finished)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+
+///////////////////////////////////////////////////////////
+struct App_StateV1 // concurrent
 {
     CURL_Async _curl_async{};
     std::int32_t _requests = 0;
@@ -167,12 +224,12 @@ struct App00_State
     std::string _r1;
     std::string _r2;
 
-    explicit App00_State(CURL_Async curl_async) noexcept
+    explicit App_StateV1(CURL_Async curl_async) noexcept
         : _curl_async(curl_async)
     {
     }
-    App00_State(const App00_State&) = delete;
-    ~App00_State() noexcept
+    App_StateV1(const App_StateV1&) = delete;
+    ~App_StateV1() noexcept
     {
         assert(_finished);
     }
@@ -183,14 +240,14 @@ struct App00_State
         CURL_async_get(_curl_async, "localhost:5001/file1.txt", this
             , [](void* user_data, std::string response)
         {
-            App00_State& state = *static_cast<App00_State*>(user_data);
+            App_StateV1& state = *static_cast<App_StateV1*>(user_data);
             state._r1 = std::move(response);
             state.try_finish();
         });
         CURL_async_get(_curl_async, "localhost:5001/file2.txt", this
             , [](void* user_data, std::string response)
         {
-            App00_State& state = *static_cast<App00_State*>(user_data);
+            App_StateV1& state = *static_cast<App_StateV1*>(user_data);
             state._r2 = std::move(response);
             state.try_finish();
         });
@@ -215,67 +272,10 @@ struct App00_State
     }
 };
 
-static void App00_Callbacks()
+static void App_CallbacksV1()
 {
     CURL_Async curl_async = CURL_async_create();
-    App00_State app{curl_async};
-    app.start();
-    while (!app._finished)
-    {
-        CURL_async_tick(curl_async);
-    }
-    CURL_async_destroy(curl_async);
-}
-
-///////////////////////////////////////////////////////////
-struct App01_State
-{
-    CURL_Async _curl_async{};
-    bool _finished = false;
-    std::string _r1;
-    std::string _r2;
-
-    explicit App01_State(CURL_Async curl_async) noexcept
-        : _curl_async(curl_async)
-    {
-    }
-    App01_State(const App01_State&) = delete;
-    ~App01_State() noexcept
-    {
-        assert(_finished);
-    }
-
-    void start()
-    {
-        CURL_async_get(_curl_async, "localhost:5001/file1.txt", this
-            , [](void* user_data, std::string response1)
-        {
-            App01_State& state = *static_cast<App01_State*>(user_data);
-            state._r1 = std::move(response1);
-
-            CURL_async_get(state._curl_async, "localhost:5001/file2.txt", user_data
-                , [](void* user_data, std::string response2)
-            {
-                App01_State& state = *static_cast<App01_State*>(user_data);
-                state._r2 = std::move(response2);
-                state._finished = true;
-                state.done();
-            });
-        });
-    }
-
-    void done()
-    {
-        assert(_finished);
-        std::println("{}", _r1);
-        std::println("{}", _r2);
-    }
-};
-
-static void App01_Callbacks()
-{
-    CURL_Async curl_async = CURL_async_create();
-    App01_State app{curl_async};
+    App_StateV1 app{curl_async};
     app.start();
     while (!app._finished)
     {
@@ -286,6 +286,6 @@ static void App01_Callbacks()
 
 int main()
 {
-    App00_Callbacks();
-    App01_Callbacks();
+    App_CallbacksV0(); // sequential
+    App_CallbacksV1(); // concurrent
 }

@@ -371,10 +371,10 @@ static auto CO_await_all(Co_Task<Ts>&&... tasks)
 
 struct Co_CurlAsync
 {
-	struct WaitState
-	{
+    struct WaitState
+    {
         Co_CurlAsync* _self = nullptr;
-	};
+    };
     WaitState* _wait_state = nullptr;
     CURL_Async _curl_async{};
     std::string _url;
@@ -412,8 +412,8 @@ struct Co_CurlAsync
 
     ~Co_CurlAsync()
     {
-	    if (_wait_state)
-	    { // CURL_async_get() is still in progress
+        if (_wait_state)
+        { // CURL_async_get() is still in progress
             assert(_wait_state->_self == this);
             _wait_state->_self = nullptr; // dead
         }
@@ -440,19 +440,18 @@ Co_Task<std::string> CURL_coro_get(CURL_Async curl_async, std::string url)
 }
 
 ///////////////////////////////////////////////////////////
-static Co_Task<void> App00_Run(CURL_Async curl_async)
+static Co_Task<void> Coro_MainV0(CURL_Async curl_async) // sequential
 {
-    auto [r1, r2] = co_await CO_await_all(
-        CURL_coro_get(curl_async, "localhost:5001/file1.txt"),
-        CURL_coro_get(curl_async, "localhost:5001/file2.txt"));
+    const std::string r1 = co_await CURL_await_get(curl_async, "localhost:5001/file1.txt");
+    const std::string r2 = co_await CURL_await_get(curl_async, "localhost:5001/file2.txt");
     std::println("{}", r1);
     std::println("{}", r2);
 }
 
-static void App00_Coroutines()
+static void App_CoroutinesV0()
 {
     CURL_Async curl_async = CURL_async_create();
-    Co_Task task = App00_Run(curl_async);
+    Co_Task<void> task = Coro_MainV0(curl_async);
     task.resume();
     while (task.is_in_progress())
     {
@@ -462,18 +461,19 @@ static void App00_Coroutines()
 }
 
 ///////////////////////////////////////////////////////////
-static Co_Task<void> App01_Run(CURL_Async curl_async)
+static Co_Task<void> Coro_MainV1(CURL_Async curl_async) // concurrent
 {
-    const std::string r1 = co_await CURL_await_get(curl_async, "localhost:5001/file1.txt");
-    const std::string r2 = co_await CURL_await_get(curl_async, "localhost:5001/file2.txt");
+    auto [r1, r2] = co_await CO_await_all(
+        CURL_coro_get(curl_async, "localhost:5001/file1.txt"),
+        CURL_coro_get(curl_async, "localhost:5001/file2.txt"));
     std::println("{}", r1);
     std::println("{}", r2);
 }
 
-static void App01_Coroutines()
+static void App_CoroutinesV1()
 {
     CURL_Async curl_async = CURL_async_create();
-    Co_Task task = App01_Run(curl_async);
+    Co_Task<void> task = Coro_MainV1(curl_async);
     task.resume();
     while (task.is_in_progress())
     {
@@ -484,6 +484,6 @@ static void App01_Coroutines()
 
 int main()
 {
-    App00_Coroutines();
-    App01_Coroutines();
+    App_CoroutinesV0(); // sequential
+    App_CoroutinesV1(); // concurrent
 }

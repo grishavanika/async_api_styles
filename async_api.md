@@ -11,7 +11,8 @@ include-before: |
     deliberately simple, while still presenting as much details as possible.
 
     Jump to examples for [blocking](#app_blocking), [callbacks](#app_callbacks),
-    tasks, std::future, [coroutines](#app_coroutines), fibers, senders code.
+    tasks, std::future, [coroutines](#app_coroutines),
+    [fibers](#app_fibers), senders code.
 
     [Work In Progress]{.mark}.
 
@@ -694,6 +695,8 @@ async response: 'content 1'
 ```
 
 # building std::future API
+
+# building future-like task API with continuation support (.then())
 
 CODE: CH0x_future
 
@@ -3453,7 +3456,240 @@ int main()
 }
 ```
 
-# fibers (WIN32) (App_Fibers) {.unlisted .unnumbered}
+## waiting for a CURL request with a Fiber
+
+CODE: CH0x_fiber_await_curl
+
+Assuming we are withing a Fiber context already:
+
+``` cpp {.numberLines}
+void Fiber_Main(CURL_Async curl_async)
+{
+    const std::string r = CURL_fiber_get_V1(curl_async, "localhost:5001/file1.txt");
+    std::println("{}", r);
+}
+```
+
+Lets write our CURL_fiber_get_V1():
+
+``` cpp {.numberLines}
+std::string CURL_fiber_get_V1(CURL_Async curl_async, const std::string& url)
+{
+    std::optional<std::string> response;
+    CURL_async_get(curl_async, url, &response
+        , [](void* user_data, std::string response)
+    {
+        auto& state = *static_cast<std::optional<std::string>*>(user_data);
+        state.emplace(std::move(response));
+    });
+    while (response.has_value() == false)
+    {
+        this_fiber::suspend();
+    }
+    return std::move(response.value());
+}
+```
+
+In a way - it's trivial:
+
+1) we start a GET request
+2) we wait for a data in a while loop
+3) while loop suspends itself if no data yet
+4) we use a pointer to local `response` variable since it's valid until Fiber end
+
+Note: compiler can't see or prove that local variable `response` is NOT
+modified externally, hence the loop is not an infinite loop. There is no need to use
+volatile/atomic to sidestep the compiler.
+
+Given this - all good... Until someone CANCELS our Fiber Task.
+Remember, user has a reference to a FiberTask:
+
+``` cpp {.numberLines}
+FiberTask<void> task = FF_async(fibers_scheduler, &Fiber_Main, curl_async);
+```
+
+What if user drops/destroys a task while GET request is still in progress?
+
+``` cpp {.numberLines}
+FiberTask::~FiberTask()
+{
+    assert(_task);
+    _scheduler->remove_fiber_task(*_task);
+
+}
+```
+
+And remove_fiber_task() just cancels the Task in progress:
+
+``` cpp {.numberLines}
+void FiberTaskScheduler::remove_fiber_task(FiberTask_Any& task)
+{
+    if (task.is_completed() == false)
+    {
+        task.cancel();
+    }
+    _tasks_to_remove.push_back(&task);
+}
+```
+
+What happens to cancelled Fiber? There are 2 options:
+
+1) we destroy a Fiber, deallocating a memory/system Fiber; and
+2) we keep a Fiber in a pool, leaving the memory alive.
+
+Since we have a FiberPool, cancelling a Task/Fiber does not deallocate the memory
+since system Fiber is still alive. So, here:
+
+``` cpp {.numberLines}
+std::optional<std::string> response;
+CURL_async_get(curl_async, url, &response
+    , [](void* user_data, std::string response)
+{
+    auto& state = *static_cast<std::optional<std::string>*>(user_data);
+    state.emplace(std::move(response));
+});
+```
+
+when callback is invoked and Fiber was/is cancelled, our `response` local variable
+is still alive and there is no access error to deallocated memory. So.. no issue?
+
+Still, while the memory/Fiber is not deallocated, logically, it's an access to
+released resource and in practice, in our case - someone else could start another
+Fiber task that so happens gets the same Fiber. Hence, our CURL_async_get()
+callback overrides and corrupts the memory of some other task!
+
+Sadly, cancellation is a problem at the end. To handle that - since CURL_async_get()
+is not cancellable, we need to allocate a flag/state on a heap so it can outlive
+cancelled Fiber:
+
+``` cpp {.numberLines}
+std::string CURL_fiber_get(CURL_Async curl_async, const std::string& url)
+{
+    std::optional<std::string> response;
+
+    CancelToken* cancel_token = CancelToken::Make(&response);
+    cancel_token->add_ref();
+
+    CURL_async_get(curl_async, url, cancel_token
+        , [](void* user_data, std::string response)
+    {
+        CancelToken& cancel_token = *static_cast<CancelToken*>(user_data);
+        if (auto* state = cancel_token.as<std::optional<std::string>>())
+        {
+            state->emplace(std::move(response));
+        }
+        cancel_token.release();
+    });
+
+    try
+    {
+        while (response.has_value() == false)
+        {
+            this_fiber::suspend();
+        }
+        cancel_token->release();
+    }
+    catch (...) // including Exception_FiberTaskCancelled
+    {
+        cancel_token->reset();
+        cancel_token->release();
+        throw;
+    }
+
+    return std::move(response.value());
+}
+```
+
+Logically, we:
+
+1) allocate CancelToken, which is ref-counted and there are 2 users:
+   callback and the task itself
+3) remember a pointer to a local variable `response`
+3) when task is cancelled (exception thrown) - we reset the reference to `response`
+4) when callback is invoked, we check if `response` is still alive;
+   CancelToken is guaranteed to be valid since it's ref-counted.
+
+CancelToken implementation is just:
+
+``` cpp {.numberLines}
+struct CancelToken
+{
+    std::int64_t _ref_count = 0;
+    void* _user_data = nullptr;
+    static CancelToken* Make(void* user_data)
+    {
+        CancelToken* token = new(std::nothrow) CancelToken;
+        assert(token);
+        token->_ref_count = 1;
+        token->_user_data = user_data;
+        return token;
+    }
+    void add_ref()
+    {
+        _ref_count += 1;
+    }
+    void release()
+    {
+        _ref_count -= 1;
+        assert(_ref_count >= 0);
+        if (_ref_count == 0)
+        {
+            Destroy(this);
+        }
+    }
+    static void Destroy(CancelToken* token)
+    {
+        assert(token);
+        delete token;
+    }
+    void reset()
+    {
+        _user_data = nullptr;
+    }
+    template<typename T>
+    T* as() const
+    {
+        return static_cast<T*>(_user_data);
+    }
+};
+```
+
+With that in mind, complete CURL_fiber_get() within a FiberTask is:
+
+``` cpp {.numberLines}
+void Fiber_Main(CURL_Async curl_async)
+{
+    const std::string r1 = CURL_fiber_get(curl_async, "localhost:5001/file1.txt");
+    const std::string r2 = CURL_fiber_get(curl_async, "localhost:5001/file2.txt");
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
+
+int main()
+{
+    Fiber::Boot _;
+    FiberPool fiber_pool{8};
+    FiberTaskScheduler fibers_scheduler{fiber_pool};
+    CURL_Async curl_async = CURL_async_create();
+    FiberTask<void> task = FF_async(fibers_scheduler, &Fiber_Main, curl_async);
+    while (task.is_completed() == false)
+    {
+        CURL_async_tick(curl_async);
+        fibers_scheduler.schedule();
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+Note, FF_async() was extended to accept extra arguments.
+Complete code is in CH0x_fiber_await_curl.
+
+## waiting for multiple a FiberTasks
+
+CODE: CH0x_fiber_await_many
+
+
+
 # senders
 # reactive streams
 
@@ -3486,35 +3722,35 @@ CODE: App_Callbacks
 
 With callbacks API, there are 2 variations:
 
-1. doing 2 requests one after another: see `App01_Callbacks()`
-2. doing 2 requests concurrently: see `App00_Callbacks()`
+1. doing 2 sequential requests, one after another: see `App_CallbacksV0()`
+2. doing 2 requests concurrently: see `App_CallbacksV1()`
 
 ``` cpp {.numberLines}
 int main()
 {
-    App00_Callbacks();
-    App01_Callbacks();
+    App_CallbacksV0(); // sequential
+    App_CallbacksV1(); // concurrent
 }
 ```
 
 All the other sections have the same naming convention and the same main().
 
-2 requests one after another:
+SEQUENTIAL requests:
 
 ``` cpp {.numberLines}
-struct App01_State
+struct App_StateV0 // sequential
 {
     CURL_Async _curl_async{};
     bool _finished = false;
     std::string _r1;
     std::string _r2;
 
-    explicit App01_State(CURL_Async curl_async) noexcept
+    explicit App_StateV0(CURL_Async curl_async) noexcept
         : _curl_async(curl_async)
     {
     }
-    App01_State(const App01_State&) = delete;
-    ~App01_State() noexcept
+    App_StateV0(const App_StateV0&) = delete;
+    ~App_StateV0() noexcept
     {
         assert(_finished);
     }
@@ -3524,13 +3760,13 @@ struct App01_State
         CURL_async_get(_curl_async, "localhost:5001/file1.txt", this
             , [](void* user_data, std::string response1)
         {
-            App01_State& state = *static_cast<App01_State*>(user_data);
+            App_StateV0& state = *static_cast<App_StateV0*>(user_data);
             state._r1 = std::move(response1);
 
             CURL_async_get(state._curl_async, "localhost:5001/file2.txt", user_data
                 , [](void* user_data, std::string response2)
             {
-                App01_State& state = *static_cast<App01_State*>(user_data);
+                App_StateV0& state = *static_cast<App_StateV0*>(user_data);
                 state._r2 = std::move(response2);
                 state._finished = true;
                 state.done();
@@ -3546,10 +3782,10 @@ struct App01_State
     }
 };
 
-static void App01_Callbacks()
+static void App_CallbacksV0()
 {
     CURL_Async curl_async = CURL_async_create();
-    App01_State app{curl_async};
+    App_StateV0 app{curl_async};
     app.start();
     while (!app._finished)
     {
@@ -3559,10 +3795,10 @@ static void App01_Callbacks()
 }
 ```
 
-2 concurrent requests:
+CONCURRENT requests:
 
 ``` cpp {.numberLines}
-struct App00_State
+struct App_StateV1 // concurrent
 {
     CURL_Async _curl_async{};
     std::int32_t _requests = 0;
@@ -3570,12 +3806,12 @@ struct App00_State
     std::string _r1;
     std::string _r2;
 
-    explicit App00_State(CURL_Async curl_async) noexcept
+    explicit App_StateV1(CURL_Async curl_async) noexcept
         : _curl_async(curl_async)
     {
     }
-    App00_State(const App00_State&) = delete;
-    ~App00_State() noexcept
+    App_StateV1(const App_StateV1&) = delete;
+    ~App_StateV1() noexcept
     {
         assert(_finished);
     }
@@ -3586,14 +3822,14 @@ struct App00_State
         CURL_async_get(_curl_async, "localhost:5001/file1.txt", this
             , [](void* user_data, std::string response)
         {
-            App00_State& state = *static_cast<App00_State*>(user_data);
+            App_StateV1& state = *static_cast<App_StateV1*>(user_data);
             state._r1 = std::move(response);
             state.try_finish();
         });
         CURL_async_get(_curl_async, "localhost:5001/file2.txt", this
             , [](void* user_data, std::string response)
         {
-            App00_State& state = *static_cast<App00_State*>(user_data);
+            App_StateV1& state = *static_cast<App_StateV1*>(user_data);
             state._r2 = std::move(response);
             state.try_finish();
         });
@@ -3618,10 +3854,10 @@ struct App00_State
     }
 };
 
-static void App00_Callbacks()
+static void App_CallbacksV1()
 {
     CURL_Async curl_async = CURL_async_create();
-    App00_State app{curl_async};
+    App_StateV1 app{curl_async};
     app.start();
     while (!app._finished)
     {
@@ -3633,10 +3869,12 @@ static void App00_Callbacks()
 
 ## requests with coroutines {#app_coroutines}
 
-2 requests one after another:
+CODE: App_Coroutines
+
+SEQUENTIAL requests:
 
 ``` cpp {.numberLines}
-static Co_Task<void> App01_Run(CURL_Async curl_async)
+static Co_Task<void> Coro_MainV0(CURL_Async curl_async) // sequential
 {
     const std::string r1 = co_await CURL_await_get(curl_async, "localhost:5001/file1.txt");
     const std::string r2 = co_await CURL_await_get(curl_async, "localhost:5001/file2.txt");
@@ -3644,10 +3882,10 @@ static Co_Task<void> App01_Run(CURL_Async curl_async)
     std::println("{}", r2);
 }
 
-static void App01_Coroutines()
+static void App_CoroutinesV0()
 {
     CURL_Async curl_async = CURL_async_create();
-    Co_Task task = App01_Run(curl_async);
+    Co_Task<void> task = Coro_MainV0(curl_async);
     task.resume();
     while (task.is_in_progress())
     {
@@ -3660,10 +3898,10 @@ static void App01_Coroutines()
 main() loop takes a bit of space, but the actual business logic is almost the
 same as regular synchronous code.
 
-2 concurrent requests:
+CONCURRENT requests:
 
 ``` cpp {.numberLines}
-static Co_Task<void> App00_Run(CURL_Async curl_async)
+static Co_Task<void> Coro_MainV1(CURL_Async curl_async) // concurrent
 {
     auto [r1, r2] = co_await CO_await_all(
         CURL_coro_get(curl_async, "localhost:5001/file1.txt"),
@@ -3672,10 +3910,10 @@ static Co_Task<void> App00_Run(CURL_Async curl_async)
     std::println("{}", r2);
 }
 
-static void App00_Coroutines()
+static void App_CoroutinesV1()
 {
     CURL_Async curl_async = CURL_async_create();
-    Co_Task task = App00_Run(curl_async);
+    Co_Task<void> task = Coro_MainV1(curl_async);
     task.resume();
     while (task.is_in_progress())
     {
@@ -3683,4 +3921,13 @@ static void App00_Coroutines()
     }
     CURL_async_destroy(curl_async);
 }
+```
+
+## requests with fibers {#app_fibers}
+
+CODE: App_Fibers
+
+SEQUENTIAL requests:
+
+``` cpp {.numberLines}
 ```

@@ -371,10 +371,10 @@ static auto CO_await_all(Co_Task<Ts>&&... tasks)
 
 struct Co_CurlAsync
 {
-	struct WaitState
-	{
+    struct WaitState
+    {
         Co_CurlAsync* _self = nullptr;
-	};
+    };
     WaitState* _wait_state = nullptr;
     CURL_Async _curl_async{};
     std::string _url;
@@ -412,8 +412,8 @@ struct Co_CurlAsync
 
     ~Co_CurlAsync()
     {
-	    if (_wait_state)
-	    { // CURL_async_get() is still in progress
+        if (_wait_state)
+        { // CURL_async_get() is still in progress
             assert(_wait_state->_self == this);
             _wait_state->_self = nullptr; // dead
         }
