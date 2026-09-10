@@ -103,9 +103,32 @@ to give libcurl a chance to process requests. Note, however,
 requests execute concurrently now, as in - 2 requests are active at the
 same time.
 
-After this, lets build tasks, std::future, coroutines, fibers,
-senders and other variations of asynchronous API on top of C-style
-callbacks above.
+After this, lets build other variations of asynchronous API on top of C-style
+callbacks above:
+
+``` cpp {.numberLines}
+std::string CURL_get(const std::string& url);
+
+void CURL_async_get(CURL_Async curl_async
+    , const std::string& url
+    , void* user_data
+    , void (*callback)(void* user_data, std::string response));
+
+Co_CurlAsync CURL_await_get(
+    CURL_Async curl_async, const std::string& url);
+Co_Task<std::string> CURL_coro_get(
+    CURL_Async curl_async, std::string url);
+
+std::string CURL_fiber_get(
+    CURL_Async curl_async, const std::string& url);
+FiberTask<std::string> CURL_fiber_get(
+      CURL_Async curl_async
+    , const std::string& url
+    , FiberTaskScheduler& fiber_scheduler);
+
+std::future<std::string> CURL_future_get(
+    CURL_Async curl_async, const std::string& url);
+```
 
 But before that, lets wrap [libcurl C API](https://curl.se/libcurl/c/)
 for our needs.
@@ -704,7 +727,7 @@ Having CURL_async_get() leads to the next implementation that wraps everything i
 a std::future:
 
 ``` cpp {.numberLines}
-std::future<std::string> future_async_get(
+std::future<std::string> CURL_future_get(
     CURL_Async curl_async, const std::string& url)
 {
     using Promise = std::promise<std::string>;
@@ -758,7 +781,7 @@ allows to finally write something among the lines:
 int main()
 {
     CURL_Async curl_async = CURL_async_create();
-    std::future<std::string> result = future_async_get(
+    std::future<std::string> result = CURL_future_get(
         curl_async, "localhost:5001/file1.txt");
     while (is_future_ready(result) == false)
     {
@@ -3688,7 +3711,71 @@ Complete code is in CH0x_fiber_await_curl.
 
 CODE: CH0x_fiber_await_many
 
+Given a list of FiberTasks, we just wait for completion in the loop:
 
+``` cpp {.numberLines}
+template<typename... Ts>
+std::tuple<Ts...> FF_await_all(FiberTask<Ts>... tasks)
+{
+    auto wait_task = [](auto task) -> auto
+    {
+        while (task.is_completed() == false)
+        {
+            this_fiber::suspend();
+        }
+        return task.get_once();
+    };
+    return {wait_task(std::move(tasks))...};
+}
+```
+
+Here, we intentionally accept `tasks` by value so that all the tasks are consumed
+and, more importantly, if await is cancelled, all of the tasks are also discarded
+due to stack unwinding.
+
+To be able to wait for multiple CURL requests, we need to have FiberTask. We do:
+
+``` cpp {.numberLines}
+FiberTask<std::string> CURL_fiber_get(
+      CURL_Async curl_async
+    , const std::string& url
+    , FiberTaskScheduler& fiber_scheduler)
+{
+    return FF_async(fiber_scheduler, [=]()
+    {
+        return CURL_fiber_get(curl_async, url);
+    });
+}
+```
+
+Finally, doing 2 concurrent requests with Fibers is:
+
+``` cpp {.numberLines}
+void Fiber_Main(FiberTaskScheduler* fiber_scheduler, CURL_Async curl_async)
+{
+    auto [r1, r2] = FF_await_all(
+        CURL_fiber_get(curl_async, "localhost:5001/file1.txt", *fiber_scheduler),
+        CURL_fiber_get(curl_async, "localhost:5001/file2.txt", *fiber_scheduler)
+        );
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
+```
+
+We need `FiberTaskScheduler` to create children Fiber tasks, so it's a bit more
+lengthy to type all that compared with the same code for C++20 coroutines.
+
+It's possible to get rid of `fiber_scheduler` by having it implicitly available
+as a global thread local variable, so CURL_fiber_get()/or FF_async() becomes:
+
+``` cpp {.numberLines}
+FiberTask<std::string> CURL_fiber_get(
+      CURL_Async curl_async
+    , const std::string& url
+    , FiberTaskScheduler& fiber_scheduler = FiberTaskScheduler::get_current())
+```
+
+However, that's mostly irrelevant in our context.
 
 # senders
 # reactive streams
@@ -3699,10 +3786,10 @@ CODE: CH0x_fiber_await_many
 
 CODE: App_Blocking
 
-For completeness, our trivial case - doing 2 GET requests one after another:
+For completeness, our trivial case - doing 2 GET requests sequentially:
 
 ``` cpp {.numberLines}
-static void App01_Blocking()
+static void App_Blocking()
 {
     const std::string r1 = CURL_get("localhost:5001/file1.txt");
     const std::string r2 = CURL_get("localhost:5001/file2.txt");
@@ -3712,7 +3799,7 @@ static void App01_Blocking()
 
 int main()
 {
-    App01_Blocking();
+    App_Blocking();
 }
 ```
 
@@ -3930,4 +4017,59 @@ CODE: App_Fibers
 SEQUENTIAL requests:
 
 ``` cpp {.numberLines}
+static void Fiber_MainV0(CURL_Async curl_async) // sequential
+{
+    const std::string r1 = CURL_fiber_get(curl_async, "localhost:5001/file1.txt");
+    const std::string r2 = CURL_fiber_get(curl_async, "localhost:5001/file2.txt");
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
+
+static void App_CoroutinesV0()
+{
+    Fiber::Boot _;
+    FiberPool fiber_pool{8};
+    FiberTaskScheduler fibers_scheduler{fiber_pool};
+    CURL_Async curl_async = CURL_async_create();
+    FiberTask<void> task = FF_async(fibers_scheduler
+        , &Fiber_MainV0, curl_async);
+    while (task.is_completed() == false)
+    {
+        CURL_async_tick(curl_async);
+        fibers_scheduler.schedule();
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+CONCURRENT requests:
+
+``` cpp {.numberLines}
+///////////////////////////////////////////////////////////
+static void Fiber_MainV1( // concurrent
+    FiberTaskScheduler* fiber_scheduler, CURL_Async curl_async)
+{
+    auto [r1, r2] = FF_await_all(
+        CURL_fiber_get(curl_async, "localhost:5001/file1.txt", *fiber_scheduler),
+        CURL_fiber_get(curl_async, "localhost:5001/file2.txt", *fiber_scheduler)
+        );
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
+
+static void App_CoroutinesV1()
+{
+    Fiber::Boot _;
+    FiberPool fiber_pool{8};
+    FiberTaskScheduler fibers_scheduler{fiber_pool};
+    CURL_Async curl_async = CURL_async_create();
+    FiberTask<void> task = FF_async(fibers_scheduler
+        , &Fiber_MainV1, &fibers_scheduler, curl_async);
+    while (task.is_completed() == false)
+    {
+        CURL_async_tick(curl_async);
+        fibers_scheduler.schedule();
+    }
+    CURL_async_destroy(curl_async);
+}
 ```

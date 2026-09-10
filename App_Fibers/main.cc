@@ -728,7 +728,34 @@ std::tuple<Ts...> FF_await_all(FiberTask<Ts>... tasks)
     return {wait_task(std::move(tasks))...};
 }
 
-void Fiber_Main(FiberTaskScheduler* fiber_scheduler, CURL_Async curl_async)
+///////////////////////////////////////////////////////////
+static void Fiber_MainV0(CURL_Async curl_async) // sequential
+{
+    const std::string r1 = CURL_fiber_get(curl_async, "localhost:5001/file1.txt");
+    const std::string r2 = CURL_fiber_get(curl_async, "localhost:5001/file2.txt");
+    std::println("{}", r1);
+    std::println("{}", r2);
+}
+
+static void App_CoroutinesV0()
+{
+    Fiber::Boot _;
+    FiberPool fiber_pool{8};
+    FiberTaskScheduler fibers_scheduler{fiber_pool};
+    CURL_Async curl_async = CURL_async_create();
+    FiberTask<void> task = FF_async(fibers_scheduler
+        , &Fiber_MainV0, curl_async);
+    while (task.is_completed() == false)
+    {
+        CURL_async_tick(curl_async);
+        fibers_scheduler.schedule();
+    }
+    CURL_async_destroy(curl_async);
+}
+
+///////////////////////////////////////////////////////////
+static void Fiber_MainV1( // concurrent
+    FiberTaskScheduler* fiber_scheduler, CURL_Async curl_async)
 {
     auto [r1, r2] = FF_await_all(
         CURL_fiber_get(curl_async, "localhost:5001/file1.txt", *fiber_scheduler),
@@ -738,17 +765,24 @@ void Fiber_Main(FiberTaskScheduler* fiber_scheduler, CURL_Async curl_async)
     std::println("{}", r2);
 }
 
-int main()
+static void App_CoroutinesV1()
 {
     Fiber::Boot _;
     FiberPool fiber_pool{8};
     FiberTaskScheduler fibers_scheduler{fiber_pool};
     CURL_Async curl_async = CURL_async_create();
-    FiberTask<void> task = FF_async(fibers_scheduler, &Fiber_Main, &fibers_scheduler, curl_async);
+    FiberTask<void> task = FF_async(fibers_scheduler
+        , &Fiber_MainV1, &fibers_scheduler, curl_async);
     while (task.is_completed() == false)
     {
         CURL_async_tick(curl_async);
         fibers_scheduler.schedule();
     }
     CURL_async_destroy(curl_async);
+}
+
+int main()
+{
+    App_CoroutinesV0();
+    App_CoroutinesV1();
 }

@@ -47,7 +47,7 @@ std::string CURL_get(const std::string& url)
 }
 
 ///////////////////////////////////////////////////////////
-static void App01_Blocking()
+static void App_Blocking()
 {
     const std::string r1 = CURL_get("localhost:5001/file1.txt");
     const std::string r2 = CURL_get("localhost:5001/file2.txt");
@@ -57,5 +57,5 @@ static void App01_Blocking()
 
 int main()
 {
-    App01_Blocking();
+    App_Blocking();
 }

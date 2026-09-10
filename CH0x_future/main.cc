@@ -160,7 +160,7 @@ void CURL_async_get(CURL_Async curl_async
     });
 }
 
-std::future<std::string> future_async_get(
+std::future<std::string> CURL_future_get(
     CURL_Async curl_async, const std::string& url)
 {
     using Promise = std::promise<std::string>;
@@ -187,7 +187,7 @@ bool is_future_ready(const std::future<T>& future)
 int main()
 {
     CURL_Async curl_async = CURL_async_create();
-    std::future<std::string> result = future_async_get(
+    std::future<std::string> result = CURL_future_get(
         curl_async, "localhost:5001/file1.txt");
     while (is_future_ready(result) == false)
     {
