@@ -737,7 +737,7 @@ static void Fiber_MainV0(CURL_Async curl_async) // sequential
     std::println("{}", r2);
 }
 
-static void App_CoroutinesV0()
+static void App_FibersV0()
 {
     Fiber::Boot _;
     FiberPool fiber_pool{8};
@@ -765,7 +765,7 @@ static void Fiber_MainV1( // concurrent
     std::println("{}", r2);
 }
 
-static void App_CoroutinesV1()
+static void App_FibersV1()
 {
     Fiber::Boot _;
     FiberPool fiber_pool{8};
@@ -783,6 +783,6 @@ static void App_CoroutinesV1()
 
 int main()
 {
-    App_CoroutinesV0();
-    App_CoroutinesV1();
+    App_FibersV0();
+    App_FibersV1();
 }

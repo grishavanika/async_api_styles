@@ -717,87 +717,6 @@ If [python HTTP server](#serve) is running, our program should print:
 async response: 'content 1'
 ```
 
-# building std::future API
-
-# building future-like task API with continuation support (.then())
-
-CODE: CH0x_future
-
-Having CURL_async_get() leads to the next implementation that wraps everything into
-a std::future:
-
-``` cpp {.numberLines}
-std::future<std::string> CURL_future_get(
-    CURL_Async curl_async, const std::string& url)
-{
-    using Promise = std::promise<std::string>;
-    Promise* promise = new(std::nothrow) Promise;
-    assert(promise);
-    std::future<std::string> future = promise->get_future();
-    CURL_async_get(curl_async, url, promise
-        , [](void* user_data, std::string response)
-    {
-        Promise* promise = static_cast<Promise*>(user_data);
-        promise->set_value(std::move(response));
-        delete promise;
-    });
-    return future;
-}
-```
-
-Everything is just what std:: exposes. Note how we need to allocate our
-promise so it can be alive until the end of the request.
-
-All in all, we:
-
- 1. allocate `std::promise`
- 2. `std::promise` allocates shared state, used by std::future
- 3. CURL_async_get allocates `std::string` to write a response
- 4. CURL_async_get allocates `std::function` for a generic callback
- 5. CURL_async_get allocates `std::unordered_map` node to remember
-    what to call when
- 6. .. and probably something else (CURL internals, etc)
-
-Anyway, std::future is missing useful bits to work with it in a non-blocking manner:
-
- - no built-in `.is_ready()` check
- - no built-in `.then()` continuation,
-   see [Design and evolution of C++ future continuations](https://ikriv.com/blog/?p=4916)
-
-Faking `is_future_ready()` with:
-
-``` cpp {.numberLines}
-template<typename T>
-bool is_future_ready(const std::future<T>& future)
-{
-    const std::future_status status = future.wait_for(std::chrono::seconds::zero());
-    return (status == std::future_status::ready);
-}
-```
-
-allows to finally write something among the lines:
-
-``` cpp {.numberLines}
-int main()
-{
-    CURL_Async curl_async = CURL_async_create();
-    std::future<std::string> result = CURL_future_get(
-        curl_async, "localhost:5001/file1.txt");
-    while (is_future_ready(result) == false)
-    {
-        CURL_async_tick(curl_async);
-    }
-    CURL_async_destroy(curl_async);
-    std::println("async future response: '{}'", result.get());
-}
-```
-
-Missing std::future features makes it not composable; waiting 2 tasks to finish
-is the same as checking 2 flags to become true; giving not much of a win compared to
-direct use of CURL_async_get().
-
-See App_Futures, App_Callbacks.
-
 # blocking, synchronous (App_Blocking) {#sync .unlisted .unnumbered}
 
 ## on error handling {#error_handling .unlisted .unnumbered}
@@ -3777,7 +3696,112 @@ FiberTask<std::string> CURL_fiber_get(
 
 However, that's mostly irrelevant in our context.
 
+# building std::future API
+
+CODE: CH0x_future
+
+Having CURL_async_get() leads to the next implementation that wraps everything into
+a std::future:
+
+``` cpp {.numberLines}
+std::future<std::string> CURL_future_get(
+    CURL_Async curl_async, const std::string& url)
+{
+    using Promise = std::promise<std::string>;
+    Promise* promise = new(std::nothrow) Promise;
+    assert(promise);
+    std::future<std::string> future = promise->get_future();
+    CURL_async_get(curl_async, url, promise
+        , [](void* user_data, std::string response)
+    {
+        Promise* promise = static_cast<Promise*>(user_data);
+        promise->set_value(std::move(response));
+        delete promise;
+    });
+    return future;
+}
+```
+
+Everything is just what std:: exposes. Note how we need to allocate our
+promise so it can be alive until the end of the request.
+
+All in all, we:
+
+ 1. allocate `std::promise`
+ 2. `std::promise` allocates shared state, used by std::future
+ 3. CURL_async_get allocates `std::string` to write a response
+ 4. CURL_async_get allocates `std::function` for a generic callback
+ 5. CURL_async_get allocates `std::unordered_map` node to remember
+    what to call when
+ 6. .. and probably something else (CURL internals, etc)
+
+Anyway, std::future is missing useful bits to work with it in a non-blocking manner:
+
+ - no built-in `.is_ready()` check
+ - no built-in `.then()` continuation,
+   see [Design and evolution of C++ future continuations](https://ikriv.com/blog/?p=4916)
+
+Faking `is_future_ready()` with:
+
+``` cpp {.numberLines}
+template<typename T>
+bool is_future_ready(const std::future<T>& future)
+{
+    const std::future_status status = future.wait_for(std::chrono::seconds::zero());
+    return (status == std::future_status::ready);
+}
+```
+
+allows to finally write something among the lines:
+
+``` cpp {.numberLines}
+int main()
+{
+    CURL_Async curl_async = CURL_async_create();
+    std::future<std::string> result = CURL_future_get(
+        curl_async, "localhost:5001/file1.txt");
+    while (is_future_ready(result) == false)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+    std::println("async future response: '{}'", result.get());
+}
+```
+
+Missing std::future features makes it not composable; waiting 2 tasks to finish
+is the same as checking 2 flags to become true; giving not much of a win compared to
+direct use of CURL_async_get().
+
+See App_Futures, App_Callbacks.
+
+# building future-like task API with continuation support (.then())
+
+CODE: CH0x_task_basic
+
+Lets build std::future-like Task type that supports `.then()` continuations.
+
+Everything is the same as std::future, but there is a support to chain operations,
+see [std::experimental::future::then()](https://en.cppreference.com/cpp/experimental/future/then)
+and [boost::future::then()](https://www.boost.org/doc/libs/latest/doc/html/thread/synchronization.html#thread.synchronization.futures.then):
+
+``` cpp {.numberLines}
+Task<std::string> CURL_task_get(CURL_Async curl_async, const std::string& url);
+
+int main()
+{
+    Task<void> task = CURL_task_get(curl_async, "localhost:5001/file1.txt")
+        .then([](std::string response)
+    {
+        std::println("{}", response);
+    });
+    // ...
+}
+```
+
+
 # senders
+
 # reactive streams
 
 # SAMPLES
@@ -4025,7 +4049,7 @@ static void Fiber_MainV0(CURL_Async curl_async) // sequential
     std::println("{}", r2);
 }
 
-static void App_CoroutinesV0()
+static void App_FibersV0()
 {
     Fiber::Boot _;
     FiberPool fiber_pool{8};
@@ -4057,7 +4081,7 @@ static void Fiber_MainV1( // concurrent
     std::println("{}", r2);
 }
 
-static void App_CoroutinesV1()
+static void App_FibersV1()
 {
     Fiber::Boot _;
     FiberPool fiber_pool{8};
