@@ -128,6 +128,8 @@ FiberTask<std::string> CURL_fiber_get(
 
 std::future<std::string> CURL_future_get(
     CURL_Async curl_async, const std::string& url);
+Task<std::string> CURL_task_get(
+    CURL_Async curl_async, const std::string& url);
 ```
 
 But before that, lets wrap [libcurl C API](https://curl.se/libcurl/c/)
@@ -3775,7 +3777,7 @@ direct use of CURL_async_get().
 
 See App_Futures, App_Callbacks.
 
-# building future-like task API with continuation support (.then())
+# building task API with .then() support
 
 CODE: CH0x_task_basic
 
@@ -3798,6 +3800,506 @@ int main()
     // ...
 }
 ```
+
+.then() returns new Task that holds the value of whatever our callable returned
+(`Task<void>` in the example above), but it can be a value:
+
+``` cpp {.numberLines}
+Task<std::string> t;
+Task<int> next = t.then([](std::string)
+{
+    return 573;
+});
+```
+
+With such an API, .then() needs to return a Task to the caller while also holding
+same task data to set the value to it once previous task completes. That requires
+to have a separate reference-counted block under the hood. Lets start with a simple
+Task_RefCount then:
+
+``` cpp {.numberLines}
+struct Task_RefCount
+{
+    std::int64_t _ref_count = 1;
+    Task_RefCount() noexcept = default;
+    Task_RefCount(const Task_RefCount&) = delete;
+
+    void add_ref()
+    {
+        assert(_ref_count >= 0);
+        _ref_count += 1;
+    }
+
+    bool release()
+    {
+        assert(_ref_count >= 1);
+        _ref_count -= 1;
+        if (_ref_count == 0)
+        {
+            Deallocate(this);
+            return true;
+        }
+        return false;
+    }
+
+    static void Deallocate(Task_RefCount* ptr)
+    {
+        assert(ptr);
+        delete ptr;
+    }
+
+    virtual ~Task_RefCount() = default;
+};
+```
+
+We also re-use std::unique_ptr to hold the value of Task_RefCount, so there is no
+need to manually implement move operations:
+
+``` cpp {.numberLines}
+struct Task_Release
+{
+    void operator()(Task_RefCount* ptr) noexcept
+    {
+        assert(ptr);
+        ptr->release();
+    }
+};
+
+template<typename T>
+using Task_Ptr = std::unique_ptr<T, Task_Release>;
+```
+
+Now, our Task holds any value T. Lets implement Task_Storage that knows
+how to handle that since there are at least 2 complications:
+
+1) T can be void and T can be a reference; those can't be directly stored and
+2) T can be not default constructible
+
+``` cpp {.numberLines}
+template<typename T>
+struct Task_Storage : Task_RefCount
+{
+    std::variant<std::monostate, T> _value;
+    template<typename U>
+    void set_value(U&& v) noexcept
+    {
+        assert(has_value() == false);
+        _value.template emplace<1>(std::forward<U>(v));
+        finish();
+    }
+    bool has_value() const
+    {
+        return (_value.index() == 1);
+    }
+    const T& get() const noexcept
+    {
+        assert(has_value());
+        return std::get<1>(_value);
+    }
+    T consume() noexcept
+    {
+        assert(has_value());
+        T v{std::move(std::get<1>(_value))};
+        _value.template emplace<0>();
+        return v;
+    }
+    template<typename F>
+    decltype(auto) dispatch_once(F&& f)
+    {
+        return std::invoke(std::forward<F>(f), consume());
+    }
+    virtual void finish() = 0;
+};
+```
+
+`std::variant<std::monostate, T>` is there to solve non-default-constructible
+case (could be `std::optional<T>`, I prefer variant) and `T&` and `void` cases are
+Task_Storage specializations:
+
+``` cpp {.numberLines}
+template<typename T>
+struct Task_Storage<T&> : Task_RefCount
+{
+    T* _value = nullptr;
+};
+
+template<>
+struct Task_Storage<void> : Task_RefCount
+{
+    bool _has_value = false;
+};
+```
+
+The code for those is largely the same as our base case. While `set_value()`,
+`has_value()` and `get()` are self-explanatory, we also have:
+
+ - `T consume()`: just a `get()` that move the value out of the storage;
+ - `dispatch_once(F)`: calls the callable F with our value; mostly needed to
+   specialize void case so F could be invoked with no arguments; and
+ - pure virtual `finish()` that is invoked when we `set_value()`: so we can
+   handle .then() implementation/completion/continuation.
+
+Strictly speaking, that's all we need to implement just `Task<T>`. Still, for
+`.then(F)`, we need to store any user-defined callable F. Hence, we extend
+Task_Storage with Task_Callback:
+
+``` cpp {.numberLines}
+template<typename T>
+struct Task_Callback : Task_Storage<T>
+{
+    std::move_only_function<void ()> _callback;
+    virtual void finish() override
+    {
+        if (_callback)
+        {
+            std::move_only_function<void ()> call = std::move(_callback);
+            call();
+        }
+    }
+};
+```
+
+where the "trick" is to use std::function to handle all of/any user-defined callable.
+So, at the end, when we `set_value()` on our Task, this callback is invoked once
+(if set). We'll use that for .then implementation, but, for now, lets see all of
+Task details where we simply allocate Task_Callback:
+
+``` cpp {.numberLines}
+template<typename T>
+struct Task
+{
+    using type = T;
+    Task_Ptr<Task_Callback<T>> _ptr;
+    explicit Task() noexcept
+        : _ptr(new(std::nothrow) Task_Callback<T>{})
+    {
+        assert(_ptr.get());
+    }
+    ~Task() noexcept = default;
+    Task(Task&& rhs) noexcept = default;
+    Task& operator=(Task&& rhs) noexcept = default;
+    Task(const Task&) = delete;
+    Task& operator=(const Task&) = delete;
+```
+
+Then implement the usual getters/setters (set_value() and get()
+handles void case too):
+
+``` cpp {.numberLines}
+    decltype(auto) get() const
+    {
+        assert(is_valid());
+        return _ptr->get();
+    }
+
+    decltype(auto) get_once()
+    {
+        assert(is_valid());
+        return _ptr->consume();
+    }
+
+    template<typename... Ts>
+        requires ((sizeof...(Ts)) == 0)
+    void set_value(Ts&&... vs)
+    {
+        assert(is_valid());
+        _ptr->set_value();
+    }
+    template<typename... Ts>
+        requires ((sizeof...(Ts)) == 1)
+    void set_value(Ts&&... vs)
+    {
+        assert(is_valid());
+        (_ptr->set_value(std::forward<Ts>(vs)), ...);
+    }
+
+    bool has_value() const
+    {
+        assert(is_valid());
+        return _ptr->has_value();
+    }
+
+    bool is_valid() const
+    {
+        return (_ptr.get() != nullptr);
+    }
+```
+
+std::future does not expose set_value on a future directly to limit the number
+of API misuse, std::promise needs to be used; but we go with a simpler code.
+Finally, to expose reference-counter task under the hood, we add `share()` API:
+
+``` cpp {.numberLines}
+explicit Task(Task_Callback<T>* ptr) noexcept // explicit share
+    : _ptr(ptr)
+{
+    assert(ptr);
+    ptr->add_ref();
+}
+Task share()
+{
+    assert(is_valid());
+    return Task(_ptr.get());
+}
+```
+
+which allows to give a Task to the user, but also have a reference to it to set
+the value later, so we can implement .then(), which roughly does:
+
+``` cpp {.numberLines}
+auto Task<T>::then(F&& f)
+{
+    using Return = invoke_result_t<F, T>;
+    Task<Return> task;
+    _ptr->_callback = [target = task.share()]() // **HERE: remember task
+    {
+        target.set_value(...);
+    }
+    return task;
+}
+```
+
+There is one complication to implement .then() that easily: implicit task unwrap.
+Going back to .then() example:
+
+``` cpp {.numberLines}
+Task<std::string> t;
+Task<int> next = t.then([](std::string)
+{
+    return 573;
+});
+```
+
+when our callable returns `int`, .then() returns `Task<int>`. What if we want
+to start another task within the callback?:
+
+``` cpp {.numberLines}
+Task<std::string> t;
+Task<???> next = t.then([](std::string)
+{
+    return CURL_task_get("...");
+});
+```
+
+CURL_task_get() returns `Task<std::string>` on its own. This chaining is so common
+that instead of just returning `Task<Task<std::string>>` to the user, we want
+to return `Task<std::string>` directly that would represent the completed result
+of the inner `CURL_task_get()` operation. Hence, our .then() implementation
+checks the return type of the callable:
+
+``` cpp {.numberLines}
+template<typename T>
+template<typename F>
+auto Task<T>::then(F&& f)
+{
+    using Return = invoke_result_t<F, T>;
+    if constexpr (is_task_type_v<Return>)
+    {
+        Task<typename Return::type> task;
+        attach_callback(task, std::forward<F>(f));
+        return task;
+    }
+    else
+    {
+        Task<Return> task;
+        attach_callback(task, std::forward<F>(f));
+        return task;
+    }
+}
+```
+
+and if the callable `Return=Task<U>`, we get U out of it and return `Task<U>`
+to the user; otherwise, it's just `Task<Return>` as it is. The helper
+`this->attach_callback(target, callback)`:
+
+ - waits for task finish
+ - then invokes callback
+ - then sets the value of that callback to the target task
+
+Lets see the simple case:
+
+``` cpp {.numberLines}
+void Task<T>::attach_callback(Task<U>& target, F&& callback)
+{
+    _ptr->_callback = [
+          f = std::forward<F>(callback)
+        , self_ptr = _ptr.get()
+        , target = target.share()
+        ]() mutable
+    {
+        target.set_value(
+            self_ptr->dispatch_once(std::move(f))); // calls f
+    };
+
+    if (_ptr->has_value())
+    {
+        _ptr->finish(); // invokes _callback
+    }
+    // else: to be invoked later, on a first call to set_value()
+};
+```
+
+where we:
+
+1) remember the `target` task for which the value needs to be set once we are done;
+2) setup `_callback` that's going to be executed on our `finish()`;
+3) once on finish(), we invoke the callback with dispatch_once() wrapper; and
+4) set a value for our target task.
+
+Note that `target` task IS what user gets (here `target` is our `next`):
+
+``` cpp {.numberLines}
+Task<std::string> t;
+Task<int> next = t.then([](std::string)
+{
+    return 573;
+});
+```
+
+On the other hand, if user callable returns `Task<T>`, we need to attach callback
+to that Task instead:
+
+``` cpp {.numberLines}
+void Task<T>::attach_callback(Task<U>& target, F&& callback)
+{
+    using Result = invoke_result_t<F, T>;
+
+    _ptr->_callback = [
+          f = std::forward<F>(callback)
+        , self_ptr = _ptr.get()
+        , target = target.share()
+        ]() mutable
+    {
+        if constexpr (is_task_type_v<Result> == false)
+        {
+            target.set_value(
+                self_ptr->dispatch_once(std::move(f)));
+        }
+        else // unwrap inner Task
+        {
+            auto inner_task = self_ptr->dispatch_once(std::move(f));
+            inner_task.attach_callback(target, Identity_Callback<U>{});
+        }
+    };
+
+    if (_ptr->has_value())
+    {
+        _ptr->finish();
+    }
+};
+```
+
+There are nuances of handling the case when callable returns `void`. Full code is in
+CH0x_task_basic.
+
+With that in mind, we can use Tasks like this:
+
+``` cpp {.numberLines}
+Task<int> task;
+task.then([](int v)
+{
+    std::println("got {}", v);
+});
+std::println("-- set task to 5");
+task.set_value(5); // invokes callback
+```
+
+or unwrap the inner task like so:
+
+``` cpp {.numberLines}
+Task<void> task;
+Task<int> inner;
+Task<int> end = task.then([&inner]()
+{
+    std::println("task end");
+    return inner.share();
+});
+std::println("-- set task");
+task.set_value();
+assert(end.has_value() == false); // not yet, inner is in progress
+std::println("-- set INNER task to 9");
+inner.set_value(9);
+std::println("got {}", end.get()); // prints 9
+```
+
+That task chaining is less unintuitive once real function that returns Task
+is invoked instead of dummy inner task. Lets wrap CURL_async_get() to return a Task.
+
+## wrapping CURL get into a Task
+
+CODE: CH0x_task_curl
+
+Implementing `CURL_task_get()` is trivial:
+
+``` cpp {.numberLines}
+Task<std::string> CURL_task_get(CURL_Async curl_async, const std::string& url)
+{
+    Task<std::string> task;
+    void* ptr = task.share_address();
+    CURL_async_get(curl_async, url, ptr
+        , [](void* user_data, std::string response)
+    {
+        Task<std::string> task = Task<std::string>::from_address(user_data);
+        task.set_value(std::move(response));
+    });
+    return task;
+}
+```
+
+Here, to pass void* pointer to our CURL_async_get(), we implement `share_address()`:
+
+``` cpp {.numberLines}
+void* share_address()
+{
+    assert(_ptr);
+    _ptr->add_ref();
+    return _ptr.get();
+}
+
+static Task from_address(void* ptr)
+{
+    assert(ptr);
+    Task_Callback<T>* task_ptr = static_cast<Task_Callback<T>*>(ptr);
+    Task task{task_ptr};
+    task_ptr->release();
+    return task;
+}
+```
+
+That's possible since our internal pointer is reference counted and we have full
+access to the details.
+
+Doing 2 sequential CURL get requests is
+
+``` cpp {.numberLines}
+static Task<void> Main_Task(CURL_Async curl_async)
+{
+    return CURL_task_get(curl_async, "localhost:5001/file1.txt")
+        .then([curl_async](std::string r1)
+    {
+        std::println("{}", r1);
+        return CURL_task_get(curl_async, "localhost:5001/file2.txt")
+            .then([](std::string r2)
+        {
+            std::println("{}", r2);
+        });
+    });
+}
+
+int main()
+{
+    CURL_Async curl_async = CURL_async_create();
+    Task<void> task = Main_Task(curl_async);
+    while (task.has_value() == false)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+## waiting for multiple Task requests
+
 
 
 # senders
