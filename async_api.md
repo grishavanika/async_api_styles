@@ -2,16 +2,16 @@
 title: Asynchronous API
 include-before: |
 
-    Below, we showcase different variations of asynchronous APIs
-    built on top of C-style callbacks with examples of
-    doing 2 GET requests - both sequentially and concurrently.
+    Below, different variations of asynchronous APIs built on top of C-style
+    callbacks with examples of doing 2 GET requests - both sequentially
+    and concurrently are showcased.
 
     NO threads are involved intentionally, to disconnect any associations
     of coroutines or fibers with multithreading. Some parts are
     deliberately simple, while still presenting as much details as possible.
 
     Jump to examples for [blocking](#app_blocking), [callbacks](#app_callbacks),
-    tasks, std::future, [coroutines](#app_coroutines),
+    [tasks](#app_tasks), [std::future](#app_futures), [coroutines](#app_coroutines),
     [fibers](#app_fibers), senders code.
 
     [Work In Progress]{.mark}.
@@ -4300,7 +4300,157 @@ int main()
 
 ## waiting for multiple Task requests
 
+CODE: CH0x_task_many
 
+Lets wait for N Tasks - Tasks_WhenAll():
+
+``` cpp {.numberLines}
+template<typename... Ts>
+Task<std::tuple<Ts...>> Tasks_WhenAll(Task<Ts>&&... tasks);
+
+int main()
+{
+    Task<int> t1;
+    Task<char> t2;
+    Tasks_WhenAll(t1.share(), t2.share())
+        .then([](std::tuple<int, char> v)
+    {
+        auto [x, y] = v;
+        std::println("{} {}", x, y);
+    });
+    t1.set_value(1);
+    t2.set_value('a');
+}
+```
+
+Given 2 tasks, `Task<int>` and `Task<char>`, waiting for them give us
+`std::tuple<int, char>` back. Since tasks may be not ready yet, we return
+`Task<std::tuple<int, char>>`. Conceptually, we need to do something like this:
+
+``` cpp {.numberLines}
+Task<std::tuple<int, char>> Tasks_WhenAll(Task<int> t1, Task<char> t2)
+{
+    Task<std::tuple<int, char>> out;
+    t1.then([](int v)
+    {
+        // set v to slot 0 of out tuple
+        // complete out task if we are last
+    });
+    t2.then([](char v)
+    {
+        // set v to slot 1 of out tuple
+        // complete out task if we are last
+    });
+    return out;
+}
+```
+
+Again, since t1 and t2 may complete out of order, we need to resort to reference
+counting again and have some internal state that completes when last task completes.
+
+Lets re-use Task_Storage that is reference-counted already. For a case of
+waiting for `Task<int>` and `Task<char>`, we have:
+
+``` cpp {.numberLines}
+auto Tasks_WhenAll0(Task<int>&& task0, Task<char>&& task1)
+{
+    auto* state = new(std::nothrow) WhenAll_State0{};
+    assert(state);
+
+    state->start_all(std::move(task0), std::move(task1));
+
+    auto task = state->_task.share();
+    state->release(); // already owned by start_all()
+    return task;
+}
+```
+
+where `state` manages all the logic. WhenAll_State0 example is:
+
+``` cpp {.numberLines}
+struct WhenAll_State0 : Task_Storage<std::tuple<int, char>>
+{
+    Task<std::tuple<int, char>> _task;
+    WhenAll_State0() noexcept
+    {
+        this->_value.template emplace<1>();
+    }
+    ~WhenAll_State0() noexcept
+    {
+        finish();
+    }
+    std::tuple<int, char>& data()
+    {
+        return std::get<1>(this->_value);
+    }
+    virtual void finish() override
+    {
+        _task.set_value(this->consume());
+    }
+```
+
+where we just use Task_Storage as our implementation detail and on `finish()` - move
+the data from out internal storage to the task itself. `start_all()` starts waiting
+for both of the tasks:
+
+``` cpp {.numberLines}
+void WhenAll_State0::start_all(Task<int>&& task0, Task<char>&& task1)
+{
+    start0(std::move(task0));
+    start1(std::move(task1));
+}
+void WhenAll_State0::start0(Task<int>&& task)
+{
+    this->add_ref();
+    task.then([this, self = Task_Ptr<>{this}](int v)
+    {
+        std::get<0>(data()) = std::move(v);
+    });
+}
+void WhenAll_State0::start1(Task<char>&& task)
+{
+    this->add_ref();
+    task.then([this, self = Task_Ptr<>{this}](char v)
+    {
+        std::get<1>(data()) = std::move(v);
+    });
+}
+```
+
+start0() does:
+
+1. increment our reference count so this state is alive until the end of the task
+2. remember itself as `self = Task_Ptr<>{this}` to properly decrement the counter
+3. on complete, save the value AND decrement `self` (implicitly destroyed).
+
+More generic implementation of Tasks_WhenAll() does the same:
+
+``` cpp {.numberLines}
+template<typename... Ts>
+auto Tasks_WhenAll(Task<Ts>&&... tasks)
+{
+    static_assert(sizeof...(Ts) >= 1);
+    static_assert(std::conjunction_v<is_value_type<Ts>...>
+        , "Task<void> or Task<T&> is not implemented");
+    static_assert(std::conjunction_v<std::is_default_constructible<Ts> ...>
+        , "Waiting a Task<T> with non-default-constructible T is not implemented");
+
+    using Tuple = std::tuple<Ts...>;
+
+    auto* state = new(std::nothrow) WhenAll_State<Task<Tuple>>{};
+    assert(state);
+
+    state->start_all(std::tuple<Task<Ts>...>{std::move(tasks)...}
+        , std::index_sequence_for<Ts...>{});
+
+    auto task = state->_task.share();
+    state->release();
+    return task;
+}
+```
+
+The limitations (no `Task<void>` or `Task<T&>`) could be implemented,
+but do no change the point. See the full code in CH0x_task_many.
 
 # senders
 
@@ -4595,6 +4745,71 @@ static void App_FibersV1()
     {
         CURL_async_tick(curl_async);
         fibers_scheduler.schedule();
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+## polling requests with std::futures {#app_futures}
+
+## requests with Tasks .then() {#app_tasks}
+
+CODE: App_Tasks
+
+SEQUENTIAL requests:
+
+``` cpp {.numberLines}
+static Task<void> Task_MainV0(CURL_Async curl_async) // sequential
+{
+    return CURL_task_get(curl_async, "localhost:5001/file1.txt")
+        .then([curl_async](std::string r1)
+    {
+        std::println("{}", r1);
+        return CURL_task_get(curl_async, "localhost:5001/file2.txt")
+            .then([](std::string r2)
+        {
+            std::println("{}", r2);
+        });
+    });
+}
+
+static void App_TasksV0()
+{
+    CURL_Async curl_async = CURL_async_create();
+    Task<void> task = Task_MainV0(curl_async);
+    while (task.has_value() == false)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+CONCURRENT requests:
+
+``` cpp {.numberLines}
+///////////////////////////////////////////////////////////
+static Task<void> Task_MainV1(CURL_Async curl_async) // concurrent
+{
+    return Tasks_WhenAll(
+        CURL_task_get(curl_async, "localhost:5001/file1.txt"),
+        CURL_task_get(curl_async, "localhost:5001/file2.txt")
+        )
+        .then([](std::tuple<std::string, std::string> vs)
+    {
+        const auto& [r1, r2] = vs;
+        std::println("{}", r1);
+        std::println("{}", r2);
+    });
+}
+
+static void App_TasksV1()
+{
+    CURL_Async curl_async = CURL_async_create();
+    Task<void> task = Task_MainV1(curl_async);
+    while (task.has_value() == false)
+    {
+        CURL_async_tick(curl_async);
     }
     CURL_async_destroy(curl_async);
 }
