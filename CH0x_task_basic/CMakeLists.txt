@@ -3,3 +3,4 @@ project(ASYNC_API LANGUAGES CXX)
 
 add_executable(CH0x_task_basic main.cc)
 target_compile_features(CH0x_task_basic PUBLIC cxx_std_23)
+set_property(DIRECTORY PROPERTY VS_STARTUP_PROJECT CH0x_task_basic)

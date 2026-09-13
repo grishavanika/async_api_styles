@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 project(ASYNC_API LANGUAGES CXX)
 
+# will fetch stdexec, disabled by default
+# add_subdirectory(App_Senders)
+# add_subdirectory(CH0x_senders_basic)
+# add_subdirectory(CH0x_senders_curl)
+
 add_subdirectory(App_Blocking)
 add_subdirectory(App_Callbacks)
 add_subdirectory(App_Coroutines)

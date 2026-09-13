@@ -13,10 +13,13 @@ include-before: |
     Jump to examples for [blocking requests](#app_blocking),
     [callbacks](#app_callbacks), [tasks .then()](#app_tasks),
     [std::future (polling)](#app_futures), [coroutines](#app_coroutines),
-    [fibers](#app_fibers), senders code.
+    [fibers](#app_fibers), [senders](#app_senders).
 
-    [Work In Progress]{.mark}. [HTML](https://grishavanika.github.io/async_api.html),
-    [PDF](https://grishavanika.github.io/async_api.pdf)
+    [Work In Progress]{.mark}. 
+
+    View: [HTML](https://grishavanika.github.io/async_api.html),
+    [PDF](https://grishavanika.github.io/async_api.pdf),
+    [source code](https://github.com/grishavanika/async_api_styles).
 
 ---
 
@@ -132,6 +135,9 @@ std::future<std::string> CURL_future_get(
     CURL_Async curl_async, const std::string& url);
 Task<std::string> CURL_task_get(
     CURL_Async curl_async, const std::string& url);
+
+CURL_Get_Sender CURL_sender_get(
+    CURL_Async curl_async, const std::string& url);
 ```
 
 But before that, lets wrap [libcurl C API](https://curl.se/libcurl/c/)
@@ -183,10 +189,10 @@ CMakeLists.txt now looks like this:
 cmake_minimum_required(VERSION 3.24 FATAL_ERROR)
 project(async_api LANGUAGES CXX)
 
-add_executable(00_cmake_libcurl main.cc)
-target_compile_features(00_cmake_libcurl PUBLIC cxx_std_23)
+add_executable(CH00_cmake main.cc)
+target_compile_features(CH00_cmake PUBLIC cxx_std_23)
 find_package(CURL REQUIRED)
-target_link_libraries(00_cmake_libcurl PRIVATE CURL::libcurl)
+target_link_libraries(CH00_cmake PRIVATE CURL::libcurl)
 ```
 
 `find_package(CURL REQUIRED)` syntax together with `CURL::libcurl`
@@ -221,7 +227,7 @@ cmake -S . -B __build ^
   -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
 cmake --build __build --config Debug
 :: run a test
-.\__build\CH00_cmake\Debug\CH00_cmake.exe
+.\__build\Debug\CH00_cmake.exe
 ```
 
 This assumes `cmake.exe` is in your `PATH`, see `build.cmd`.
@@ -4454,7 +4460,444 @@ auto Tasks_WhenAll(Task<Ts>&&... tasks)
 The limitations (no `Task<void>` or `Task<T&>`) could be implemented,
 but do no change the point. See the full code in CH0x_task_many.
 
-# senders
+# building C++26 senders
+
+CODE: CH0x_senders_basic
+
+Required read: [What are Senders Good For, Anyway?](https://ericniebler.com/2024/02/04/what-are-senders-good-for-anyway/).
+
+std::execution, accepted in C++26 [P2300R10](http://wg21.link/P2300R10) provides
+a framework for managing asynchronous execution. Eric Niebler has a nice intro above
+among few other [videos](https://youtu.be/xLboNIf7BTg?si=EhiqvfhuuHWD_1Tc)
+on the topic. Some examples of senders and receivers are provided in
+[P2300R10](http://wg21.link/P2300R10). In addition, stdexec has nice
+[Developer’s Guide](https://nvidia.github.io/stdexec/developer/index.html).
+
+Ultimately, we'd like to write a Sender that wraps our CURL_async_get() and produces
+a response:
+
+``` cpp {.numberLines}
+SENDER CURL_sender_get(CURL_Async curl_async, const std::string& url);
+
+auto App_Senders(CURL_Async curl_async)
+{
+    return CURL_sender_get(curl_async, "localhost:5001/file1.txt")
+        | stdexec::then([](std::string r)
+    {
+        std::println("{}", r);
+    });
+}
+```
+
+or, with Sender's coroutines support:
+
+``` cpp {.numberLines}
+stdexec::task<void> App_Senders(CURL_Async curl_async)
+{
+    const std::string r = co_await CURL_sender_get(
+        curl_async, "localhost:5001/file1.txt");
+    std::println("{}", r);
+}
+```
+
+We'll use [stdexec](https://github.com/NVIDIA/stdexec) for a start since
+writing simple senders and receivers library version is too much (probably).
+As of [2026/09/13](https://github.com/NVIDIA/stdexec/commit/ae896337cbcfc242df609585a47f9822a0b48545),
+stdexec requires at least Visual Studio 2022 version 17.13.0 (MSVC 14.43).
+
+We start by building simplest sender that does nothing:
+
+``` cpp {.numberLines}
+struct Sender
+{
+};
+
+Sender work()
+{
+    return Sender{};
+}
+
+int main()
+{
+    stdexec::sync_wait(work());
+}
+```
+
+where `sync_wait()` starts our Sender and blocks the execution until the end.
+To make it compile, `Sender` is missing several required bits:
+
+``` cpp {.numberLines}
+struct Sender
+{
+    using sender_concept = stdexec::sender_tag;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t ()>;
+
+    template<typename Receiver>
+    auto connect(Receiver&& receiver)
+    {
+        using Receiver_ = std::remove_cvref_t<Receiver>;
+        return State<Receiver_>{std::forward<Receiver>(receiver)};
+    }
+};
+```
+
+where we, basically, say that:
+
+1) Sender is... a Sender concept (sender_tag).
+2) Our Sender will only return void/nothing - that completion_signatures. And
+3) The Sender requires State when connected to any compatible Receiver.
+
+(If nothing clicks, read [What are Senders Good For, Anyway?](https://ericniebler.com/2024/02/04/what-are-senders-good-for-anyway/)).
+
+Our State is:
+
+``` cpp {.numberLines}
+template<typename Receiver>
+struct State
+{
+    using operation_state_concept = stdexec::operation_state_tag;
+
+    void start() noexcept
+    {
+        stdexec::set_value(std::move(_receiver));
+    }
+
+    Receiver _receiver;
+};
+```
+
+where we:
+
+1) Say that State is operation_state concept.
+2) When operation starts, we immediately complete it by
+   invoking set_value() on our receiver.
+
+With this, we can use our Sender:
+
+``` cpp {.numberLines}
+Sender work()
+{
+    return Sender{};
+}
+
+int main()
+{
+    std::optional<std::tuple<>> x = stdexec::sync_wait(work());
+    assert(x.has_value());
+}
+```
+
+Note: sync_wait() returns an optional since, in general, sender/operation can fail
+and a tuple, since sender can return multiple values.
+
+Since Sender concept is compatible with C++20 coroutines awaitable, just implementing
+a Sender allows to use it in coroutines. So, next coroutine works just fine too:
+
+``` cpp {.numberLines}
+Sender work()
+{
+    return Sender{};
+}
+
+stdexec::task<void> work_coro()
+{
+    co_await work();
+}
+
+int main()
+{
+    std::optional<std::tuple<>> x = stdexec::sync_wait(work_coro());
+    assert(x.has_value());
+}
+```
+
+## sender for a CURL get
+
+CODE: CH0x_senders_curl
+
+Lets adapt our simple Sender to return ("send") a std::string - i.e., what
+CURL_async_get() returns:
+
+``` cpp {.numberLines}
+CURL_Get_Sender CURL_sender_get(CURL_Async curl_async, const std::string& url)
+{
+    return CURL_Get_Sender{}; // TBD
+}
+```
+
+where CURL_Get_Sender is:
+
+``` cpp {.numberLines}
+template<typename Receiver>
+struct CURL_Get_State
+{
+    using operation_state_concept = stdexec::operation_state_tag;
+
+    void start() noexcept
+    {
+        stdexec::set_value(std::move(_receiver), std::string{});
+    }
+
+    Receiver _receiver;
+};
+
+struct CURL_Get_Sender
+{
+    using sender_concept = stdexec::sender_tag;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t (std::string)>;
+
+    template<typename Receiver>
+    auto connect(Receiver&& receiver)
+    {
+        using Receiver_ = std::remove_cvref_t<Receiver>;
+        return CURL_Get_State<Receiver_>{std::forward<Receiver>(receiver)};
+    }
+};
+```
+
+See, completion_signatures now indicate that we set_value(std::string) and inside
+operation `start()` we now pass an empty std::string.
+
+Can we use our dummy CURL_sender_get() already?
+
+``` cpp {.numberLines}
+int main()
+{
+    CURL_Async curl_async = CURL_async_create();
+    std::optional<std::tuple<std::string>> x =
+        stdexec::sync_wait(CURL_sender_get(curl_async, "localhost:5001/file1.txt"));
+    assert(x.has_value());
+    while (???)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+Yes. But note there are 2 issues:
+
+1) sync_wait() will block execution and we'll never tick our CURL loop; and
+2) we don't know when to stop.
+
+To continue main() execution, we must remove sync_wait and manually start the Sender.
+To do that, we wrap all and every senders logic in Senders_Main():
+
+``` cpp {.numberLines}
+auto Senders_Main(CURL_Async curl_async)
+{
+    return CURL_sender_get(curl_async, "localhost:5001/file1.txt")
+        | stdexec::then([](std::string r)
+    {
+        std::println("{}", r);
+    });
+}
+```
+
+This is where anything/everything related to senders should be done.
+Next, we can manually connect() and start() our Senders_Main():
+
+``` cpp {.numberLines}
+int main()
+{
+    CURL_Async curl_async = CURL_async_create();
+    bool done = false;
+    auto state = stdexec::connect(Senders_Main(curl_async), AnyReceiver{&done});
+    stdexec::start(state);
+    while (done == false)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+where AnyReceiver is a generic receiver that accepts any and all values and just
+sets true to a bool flag:
+
+``` cpp {.numberLines}
+struct AnyReceiver
+{
+    using receiver_concept = stdexec::receiver_tag;
+
+    template<typename... Args>
+    void set_value(Args&&...) noexcept { finish(); }
+    template<typename... Args>
+    void set_error(Args&&...) noexcept { finish(); }
+    void set_stopped() noexcept        { finish(); }
+
+    void finish() noexcept
+    {
+        assert(_done);
+        assert(*_done == false);
+        *_done = true;
+    }
+
+    bool* _done = nullptr;
+};
+```
+
+Having a main() that properly runs CURL main loop, we can go back to
+CURL_sender_get() implementation:
+
+``` cpp {.numberLines}
+struct CURL_Get_Sender
+{
+    using sender_concept = stdexec::sender_tag;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t (std::string)>;
+
+    CURL_Async _curl_async = nullptr;
+    std::string _url;
+    // ...
+};
+
+CURL_Get_Sender CURL_sender_get(CURL_Async curl_async, const std::string& url)
+{
+    return CURL_Get_Sender
+    {
+        ._curl_async = curl_async,
+        ._url = url
+    };
+}
+```
+
+See how CURL_sender_get() does not do any work and passes any required input
+to CURL_Get_Sender itself. CURL_Get_Sender remembers everything until `connect()`
+is invoked. This is where operation state is finally constructed:
+
+``` cpp {.numberLines}
+struct CURL_Get_Sender
+{
+    CURL_Async _curl_async = nullptr;
+    std::string _url;
+
+    template<typename Receiver>
+    auto connect(Receiver&& receiver)
+    {
+        using Receiver_ = std::remove_cvref_t<Receiver>;
+        return CURL_Get_State<Receiver_>
+        {
+            ._receiver = std::forward<Receiver>(receiver),
+            ._curl_async = _curl_async,
+            ._url = std::move(_url)
+        };
+    }
+};
+
+template<typename Receiver>
+struct CURL_Get_State
+{
+    void start() noexcept;
+
+    Receiver _receiver;
+    CURL_Async _curl_async = nullptr;
+    std::string _url;
+};
+```
+
+CURL_Get_State also waits for start() to be invoked. At that point, we:
+
+1) can start the actual operation/work; and
+2) our state is guaranteed to be alive until we end it on our side
+
+meaning, that we can pass a pointer to state around and it's guaranteed to be alive:
+
+``` cpp {.numberLines}
+void CURL_Get_State::start() noexcept
+{
+    assert(_curl_async);
+    CURL_async_get(_curl_async, _url
+        , this // HERE, pointer to our state
+        , [](void* user_data, std::string response)
+    {
+        CURL_Get_State& state = *static_cast<CURL_Get_State*>(user_data);
+        stdexec::set_value(std::move(state._receiver), std::move(response));
+    });
+}
+```
+
+Once CURL_async_get() callback is invoked, we simply invoke the receiver and pass
+the retrieved response as a result.
+
+One more time, full CURL async get sender implementation is:
+
+``` cpp {.numberLines}
+template<typename Receiver>
+struct CURL_Get_State
+{
+    using operation_state_concept = stdexec::operation_state_tag;
+
+    void start() noexcept
+    {
+        assert(_curl_async);
+        CURL_async_get(_curl_async, _url
+            , this
+            , [](void* user_data, std::string response)
+        {
+            CURL_Get_State& state = *static_cast<CURL_Get_State*>(user_data);
+            stdexec::set_value(std::move(state._receiver), std::move(response));
+        });
+    }
+
+    Receiver _receiver;
+    CURL_Async _curl_async = nullptr;
+    std::string _url;
+};
+
+struct CURL_Get_Sender
+{
+    using sender_concept = stdexec::sender_tag;
+    using completion_signatures = stdexec::completion_signatures<
+        stdexec::set_value_t (std::string)>;
+
+    CURL_Async _curl_async = nullptr;
+    std::string _url;
+
+    template<typename Receiver>
+    auto connect(Receiver&& receiver)
+    {
+        using Receiver_ = std::remove_cvref_t<Receiver>;
+        return CURL_Get_State<Receiver_>
+        {
+            ._receiver = std::forward<Receiver>(receiver),
+            ._curl_async = _curl_async,
+            ._url = std::move(_url)
+        };
+    }
+};
+
+CURL_Get_Sender CURL_sender_get(CURL_Async curl_async, const std::string& url)
+{
+    return CURL_Get_Sender
+    {
+        ._curl_async = curl_async,
+        ._url = url
+    };
+}
+```
+
+That allows to use existing, composable senders algorithms. Executing 2 GET requests
+in sequence now becomes:
+
+``` cpp {.numberLines}
+auto Senders_Main(CURL_Async curl_async)
+{
+    return exec::sequence(
+        CURL_sender_get(curl_async, "localhost:5001/file1.txt")
+            | stdexec::then([](std::string r1)
+        {
+            std::println("{}", r1);
+        }),
+        CURL_sender_get(curl_async, "localhost:5001/file2.txt")
+            | stdexec::then([](std::string r2)
+        {
+            std::println("{}", r2);
+        }));
+}
+```
 
 # reactive streams
 
@@ -4949,6 +5392,71 @@ static void App_TasksV1()
     CURL_Async curl_async = CURL_async_create();
     Task<void> task = Task_MainV1(curl_async);
     while (task.has_value() == false)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+## requests with senders/std::execution {#app_senders}
+
+CODE: App_Senders
+
+SEQUENTIAL requests:
+
+``` cpp {.numberLines}
+auto Sender_MainV0(CURL_Async curl_async) // sequential
+{
+    return exec::sequence(
+        CURL_sender_get(curl_async, "localhost:5001/file1.txt")
+            | stdexec::then([](std::string r1)
+        {
+            std::println("{}", r1);
+        }),
+        CURL_sender_get(curl_async, "localhost:5001/file2.txt")
+            | stdexec::then([](std::string r2)
+        {
+            std::println("{}", r2);
+        }));
+}
+
+void App_SendersV0()
+{
+    CURL_Async curl_async = CURL_async_create();
+    bool done = false;
+    auto state = stdexec::connect(Sender_MainV0(curl_async), AnyReceiver{&done});
+    stdexec::start(state);
+    while (done == false)
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+CONCURRENT requests:
+
+``` cpp {.numberLines}
+auto Sender_MainV1(CURL_Async curl_async) // concurrent
+{
+    return stdexec::when_all(
+        CURL_sender_get(curl_async, "localhost:5001/file1.txt"),
+        CURL_sender_get(curl_async, "localhost:5001/file2.txt"))
+            | stdexec::then([](std::string&& r1, std::string&& r2)
+        {
+            std::println("{}", r1);
+            std::println("{}", r2);
+        });
+}
+
+void App_SendersV1()
+{
+    CURL_Async curl_async = CURL_async_create();
+    bool done = false;
+    auto state = stdexec::connect(Sender_MainV1(curl_async), AnyReceiver{&done});
+    stdexec::start(state);
+    while (done == false)
     {
         CURL_async_tick(curl_async);
     }
