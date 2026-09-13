@@ -10,11 +10,13 @@ include-before: |
     of coroutines or fibers with multithreading. Some parts are
     deliberately simple, while still presenting as much details as possible.
 
-    Jump to examples for [blocking](#app_blocking), [callbacks](#app_callbacks),
-    [tasks](#app_tasks), [std::future](#app_futures), [coroutines](#app_coroutines),
+    Jump to examples for [blocking requests](#app_blocking),
+    [callbacks](#app_callbacks), [tasks .then()](#app_tasks),
+    [std::future (polling)](#app_futures), [coroutines](#app_coroutines),
     [fibers](#app_fibers), senders code.
 
-    [Work In Progress]{.mark}.
+    [Work In Progress]{.mark}. [HTML](https://grishavanika.github.io/async_api.html),
+    [PDF](https://grishavanika.github.io/async_api.pdf)
 
 ---
 
@@ -4721,7 +4723,6 @@ static void App_FibersV0()
 CONCURRENT requests:
 
 ``` cpp {.numberLines}
-///////////////////////////////////////////////////////////
 static void Fiber_MainV1( // concurrent
     FiberTaskScheduler* fiber_scheduler, CURL_Async curl_async)
 {
@@ -4751,6 +4752,147 @@ static void App_FibersV1()
 ```
 
 ## polling requests with std::futures {#app_futures}
+
+CODE: App_Polling
+
+SEQUENTIAL requests:
+
+``` cpp {.numberLines}
+///////////////////////////////////////////////////////////
+struct App_StateV0 // sequential
+{
+    CURL_Async _curl_async{};
+    bool _finished = false;
+    std::optional<std::future<std::string>> _r1;
+    std::optional<std::future<std::string>> _r2;
+
+    explicit App_StateV0(CURL_Async curl_async) noexcept
+        : _curl_async(curl_async)
+    {
+    }
+    App_StateV0(const App_StateV0&) = delete;
+    ~App_StateV0() noexcept
+    {
+        assert(_finished);
+    }
+
+    void tick()
+    {
+        if (_finished)
+        {
+            return;
+        }
+        if ((_r1.has_value() == false)
+            && (_r2.has_value() == false))
+        { // nothing started yet, run 1st task
+            _r1 = CURL_future_get(_curl_async, "localhost:5001/file1.txt");
+            return;
+        }
+        if (_r1.has_value()
+            && (_r2.has_value() == false))
+        { // 1st task is in progress
+            if (is_future_ready(_r1.value()) == false)
+            {
+                return;
+            }
+            _r2 = CURL_future_get(_curl_async, "localhost:5001/file2.txt");
+            return;
+        }
+        // 2nd task is in progress
+        assert(_r1.has_value() && _r2.has_value());
+        if (is_future_ready(_r2.value()) == false)
+        {
+            return;
+        }
+        _finished = true;
+        done();
+        _r1.reset();
+        _r2.reset();
+    }
+    void done()
+    {
+        assert(_finished);
+        std::println("{}", _r1->get());
+        std::println("{}", _r2->get());
+    }
+};
+
+static void App_PollingV0()
+{
+    CURL_Async curl_async = CURL_async_create();
+    App_StateV0 app{curl_async};
+    while (app._finished == false)
+    {
+        CURL_async_tick(curl_async);
+        app.tick();
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+CONCURRENT requests:
+
+``` cpp {.numberLines}
+struct App_StateV1 // concurrent
+{
+    CURL_Async _curl_async{};
+    bool _finished = false;
+    std::optional<std::future<std::string>> _r1;
+    std::optional<std::future<std::string>> _r2;
+
+    explicit App_StateV1(CURL_Async curl_async) noexcept
+        : _curl_async(curl_async)
+    {
+    }
+    App_StateV1(const App_StateV0&) = delete;
+    ~App_StateV1() noexcept
+    {
+        assert(_finished);
+    }
+
+    void tick()
+    {
+        if (_finished)
+        {
+            return;
+        }
+        if ((_r1.has_value() == false)
+            && (_r2.has_value() == false))
+        { // nothing started yet, launch 2 requests
+            _r1 = CURL_future_get(_curl_async, "localhost:5001/file1.txt");
+            _r2 = CURL_future_get(_curl_async, "localhost:5001/file2.txt");
+            return;
+        }
+        assert(_r1.has_value() && _r2.has_value());
+        if (is_future_ready(_r1.value())
+            && is_future_ready(_r2.value()))
+        {
+            _finished = true;
+            done();
+            _r1.reset();
+            _r2.reset();
+        }
+    }
+    void done()
+    {
+        assert(_finished);
+        std::println("{}", _r1->get());
+        std::println("{}", _r2->get());
+    }
+};
+
+static void App_PollingV1()
+{
+    CURL_Async curl_async = CURL_async_create();
+    App_StateV1 app{curl_async};
+    while (app._finished == false)
+    {
+        CURL_async_tick(curl_async);
+        app.tick();
+    }
+    CURL_async_destroy(curl_async);
+}
+```
 
 ## requests with Tasks .then() {#app_tasks}
 
@@ -4788,7 +4930,6 @@ static void App_TasksV0()
 CONCURRENT requests:
 
 ``` cpp {.numberLines}
-///////////////////////////////////////////////////////////
 static Task<void> Task_MainV1(CURL_Async curl_async) // concurrent
 {
     return Tasks_WhenAll(

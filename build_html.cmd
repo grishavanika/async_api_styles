@@ -4,5 +4,6 @@ call pandoc -s --toc --toc-depth=4 ^
   --syntax-highlighting=kate ^
   --from markdown --to=html5 ^
   --lua-filter=pandoc-anchor-links.lua ^
+  --variable linkcolor=blue ^
   async_api.md ^
   -o async_api.html
