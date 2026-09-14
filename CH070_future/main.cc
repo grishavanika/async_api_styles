@@ -2,6 +2,8 @@
 #include <string>
 #include <functional>
 #include <unordered_map>
+#include <future>
+#include <chrono>
 
 #include <curl/curl.h>
 
@@ -158,27 +160,39 @@ void CURL_async_get(CURL_Async curl_async
     });
 }
 
-int main()
+std::future<std::string> CURL_future_get(
+    CURL_Async curl_async, const std::string& url)
 {
-    struct State
-    {
-        std::string response;
-        bool done = false;
-    };
-    CURL_Async curl_async = CURL_async_create();
-    State state;
-    CURL_async_get(curl_async, "localhost:5001/file1.txt", &state
+    using Promise = std::promise<std::string>;
+    Promise* promise = new(std::nothrow) Promise;
+    assert(promise);
+    std::future<std::string> future = promise->get_future();
+    CURL_async_get(curl_async, url, promise
         , [](void* user_data, std::string response)
     {
-        State& state_ = *static_cast<State*>(user_data);
-        state_.response = std::move(response);
-        state_.done = true;
+        Promise* promise = static_cast<Promise*>(user_data);
+        promise->set_value(std::move(response));
+        delete promise;
     });
-    while (!state.done)
+    return future;
+}
+
+template<typename T>
+bool is_future_ready(const std::future<T>& future)
+{
+    const std::future_status status = future.wait_for(std::chrono::seconds::zero());
+    return (status == std::future_status::ready);
+}
+
+int main()
+{
+    CURL_Async curl_async = CURL_async_create();
+    std::future<std::string> result = CURL_future_get(
+        curl_async, "localhost:5001/file1.txt");
+    while (is_future_ready(result) == false)
     {
         CURL_async_tick(curl_async);
     }
     CURL_async_destroy(curl_async);
-
-    std::println("{}", state.response);
+    std::println("{}", result.get());
 }

@@ -147,7 +147,7 @@ for our needs.
 
 # setup with CMake + libcurl {#cmake}
 
-CODE: CH00_cmake
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH00_cmake).
 
 For [vcpkg](https://github.com/microsoft/vcpkg), there is an extensive
 [documentation](https://learn.microsoft.com/en-us/vcpkg/get_started/get-started)
@@ -234,7 +234,8 @@ This assumes `cmake.exe` is in your `PATH`, see `build.cmd`.
 
 # building blocking API {#libcurl_easy}
 
-CODE: CH01_libcurl_easy
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH01_libcurl_easy),
+[sample app](#app_blocking).
 
 Blocking, synchronous API for a GET request is straightforward.
 We go with a function that looks like this:
@@ -323,7 +324,7 @@ To see the code in action, lets run our program:
 int main()
 {
     const std::string r = CURL_get("localhost:5001/file1.txt");
-    std::println("CURL_get(file1.txt): '{}'", r);
+    std::println("{}", r);
 }
 ```
 
@@ -334,13 +335,12 @@ that.. should crash since we don't have local HTTP server running to serve
 Once done, we should see the sample file1.txt content in the console output:
 
 ```
-CURL_get(file1.txt): 'content 1'
-
+Fox
 ```
 
 ## run simple http server for tests {#serve}
 
-CODE: CH01_libcurl_easy
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH01_libcurl_easy).
 
 To run sample code, lets use Python to have simple HTTP server that hosts
 files in the current directory, see `serve.cmd`:
@@ -349,13 +349,15 @@ files in the current directory, see `serve.cmd`:
 python -m http.server 5001
 ```
 
-Given the directory that has file1.txt and file2.txt,
+Given the directory that has [file1.txt](https://raw.githubusercontent.com/grishavanika/async_api_styles/refs/heads/main/CH01_libcurl_easy/file1.txt)
+and [file2.txt](https://raw.githubusercontent.com/grishavanika/async_api_styles/refs/heads/main/CH01_libcurl_easy/file2.txt)
 `CURL_get("localhost:5001/file1.txt")` should work and return the content
 of the file, see [blocking libcurl section](#libcurl_easy).
 
 # building C-style callbacks API {#libcurl_multi}
 
-CODE: CH02_libcurl_multi
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH02_libcurl_multi),
+[sample app](#app_callbacks).
 
 ## thoughts on the design {#libcurl_multi_design}
 
@@ -483,7 +485,8 @@ callbacks-based APIs.
 
 ## implementing with libcurl multi {#libcurl_multi_impl}
 
-CODE: CH02_libcurl_multi
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH02_libcurl_multi),
+[sample app](#app_callbacks).
 
 For our callbacks [API](#libcurl_multi_design):
 
@@ -724,10 +727,8 @@ int main()
 If [python HTTP server](#serve) is running, our program should print:
 
 ``` cpp {.numberLines}
-async response: 'content 1'
+Fox
 ```
-
-# blocking, synchronous (App_Blocking) {#sync .unlisted .unnumbered}
 
 ## on error handling {#error_handling .unlisted .unnumbered}
 
@@ -740,14 +741,11 @@ async response: 'content 1'
 ### result/tuple-like {.unlisted .unnumbered}
 ### result/specialized {.unlisted .unnumbered}
 
-# async polling, tasks  (App_Tasks) {.unlisted .unnumbered}
-# blocking std::future/promise {.unlisted .unnumbered}
-# async polling, std::future/promise {.unlisted .unnumbered}
-# async, callbacks (App_Callbacks) {.unlisted .unnumbered}
-# async, callbacks + polling (tasks, handle) {.unlisted .unnumbered}
 # async with statefull/implicit callback (state.on_X.subscribe/delegates) {.unlisted .unnumbered}
 
-# building C++20 coroutines API
+# building C++20 coroutines API {#coro_api}
+
+[sample app](#app_coroutines).
 
 Coroutines materials:
 
@@ -793,7 +791,7 @@ Lets start with basics.
 
 ## C++ coroutines, basic task type
 
-CODE: CH0x_coro_basic_task
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH051_coro_basic_task).
 
 There is a trick to writing some basic C++20 coroutines code - **listen to the
 compiler**. Lets see what it takes to make the next code "work":
@@ -1079,7 +1077,7 @@ inside coro_work
 
 ## C++ coroutines, basic await
 
-CODE: CH0x_coro_basic_await
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH052_coro_basic_await).
 
 Given that we can have simplest coroutine, what does it take to co_await?
 Lets try to compile:
@@ -1171,7 +1169,7 @@ But we also could start an async operation and, on finish, resume the coroutine.
 
 ## C++ coroutines, await callback with a crash
 
-CODE: CH0x_coro_curl0
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH053_coro_curl0).
 
 Lets continue implementing `Co_CurlAsync` above, in short:
 
@@ -1238,7 +1236,7 @@ Co_Task coro_main(CURL_Async curl_async)
     const std::string response = co_await CURL_await_get(
         curl_async, "localhost:5001/file1.txt");
 
-    std::println("coro_main response: '{}'", response);
+    std::println("{}", response);
     co_return;
 }
 
@@ -1269,8 +1267,7 @@ bool Co_Task::is_in_progress() const
 Running the sample should print:
 
 ```
-coro_main response: 'content 1'
-
+Fox
 ```
 
 However, that works because we wait for coroutine until full complete. If
@@ -1328,7 +1325,7 @@ nor in callback API.
 
 ## C++ coroutines, await callback
 
-CODE: CH0x_coro_curl
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH054_coro_curl).
 
 Lets fix the problematic part in a simple way:
 
@@ -1484,7 +1481,7 @@ when first co_await ends. There is no concurrency..
 
 ## coroutine task that holds a return value
 
-CODE: CH0x_coro_task
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH055_coro_task).
 
 To be more useful, we'd like to be able return something out of coroutine:
 
@@ -1498,7 +1495,7 @@ int main()
 {
     Co_Task<int> task = coro_main();
     task.resume();
-    std::println("coro main: {}", task.get_once());
+    std::println("{}", task.get_once());
 }
 ```
 
@@ -1612,7 +1609,7 @@ static Co_Task<int> coro_main()
 
 ## awaiting coroutine task
 
-CODE: CH0x_coro_await_task
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH056_coro_await_task).
 
 Now, given `Co_Task<T>`, we need to await for it somehow:
 
@@ -1834,7 +1831,7 @@ int main()
 {
     Co_Task<int> task = coro_main();
     task.resume();
-    std::println("coro main: {}", task.get_once());
+    std::println("{}", task.get_once());
 }
 ```
 
@@ -1850,6 +1847,8 @@ static Co_Task<int> coro_main()
 ```
 
 ## waiting for multiple coroutines
+
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH057_coro_await_all).
 
 Lets implement awaiting for multiple Co_Tasks:
 
@@ -2025,7 +2024,7 @@ int main()
 
 ## waiting for multiple CURL requests with tasks
 
-CODE: CH0x_coro_await_curl
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH058_coro_await_curl).
 
 We already built CURL_await_get() that awaits CURL request within a coroutine.
 With CO_await_all() API, we can await for multiple concurrent CURL requests
@@ -2054,7 +2053,7 @@ intermediate coroutines.
 
 ## waiting for multiple CURL request with custom awaitable
 
-CODE: CH0x_coro_await_many
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH059_coro_await_many).
 
 Instead of CURL_coro_get() + CO_await_all():
 
@@ -2253,9 +2252,10 @@ For the rest of the sample code, we'll go using `CO_await_all()` version.
 
 # coroutines on top polling tasks {.unlisted .unnumbered}
 
-# building Fibers API
+# building Fibers API {#fibers_api}
 
-CODE: CH0x_fiber_basic
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH060_fiber_basic),
+[sample app](#app_fibers).
 
 (Win32) Fibers materials:
 
@@ -2337,7 +2337,7 @@ main3
 
 ## basic Fiber
 
-CODE: CH0x_fiber_basic
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH060_fiber_basic).
 
 We start with a `Fiber` class that allocates a fiber:
 
@@ -2517,7 +2517,7 @@ main3
 
 ## switching between Fibers
 
-CODE: CH0x_fiber_switch
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH062_fiber_switch).
 
 Section above shows how we can switch from a main to a different Fiber.
 Fiber on it's own, when suspended, switches back to its invoker/resumer.
@@ -2687,7 +2687,7 @@ not required for CURL_async_get() Fiber wrapper.
 
 ## cancellable Fiber task with a generic callback
 
-CODE: CH0x_fiber_callback
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH064_fiber_callback).
 
 First, we start with replacing hardcoded `Fiber::run()` with a generic
 version that uses next interface:
@@ -2914,7 +2914,7 @@ main3
 
 ## basic FiberPool
 
-CODE: CH0x_fiber_task
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH065_fiber_task).
 
 The idea is simple: fiber task can be small and short-lived,
 there is no point allocating (and dealocating) a
@@ -3028,7 +3028,7 @@ Now, lets get rid of manually created MyFiberTask and make
 
 ## FiberTask
 
-CODE: CH0x_fiber_task
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH065_fiber_task).
 
 We'd like to be able to write something like this:
 
@@ -3410,7 +3410,7 @@ int main()
 
 ## waiting for a CURL request with a Fiber
 
-CODE: CH0x_fiber_await_curl
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH067_fiber_await_curl).
 
 Assuming we are withing a Fiber context already:
 
@@ -3634,11 +3634,10 @@ int main()
 ```
 
 Note, FF_async() was extended to accept extra arguments.
-Complete code is in CH0x_fiber_await_curl.
 
 ## waiting for multiple a FiberTasks
 
-CODE: CH0x_fiber_await_many
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH068_fiber_await_many).
 
 Given a list of FiberTasks, we just wait for completion in the loop:
 
@@ -3706,9 +3705,10 @@ FiberTask<std::string> CURL_fiber_get(
 
 However, that's mostly irrelevant in our context.
 
-# building std::future API
+# building std::future API {#futures_api}
 
-CODE: CH0x_future
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH070_future),
+[sample app](#app_futures).
 
 Having CURL_async_get() leads to the next implementation that wraps everything into
 a std::future:
@@ -3775,7 +3775,7 @@ int main()
         CURL_async_tick(curl_async);
     }
     CURL_async_destroy(curl_async);
-    std::println("async future response: '{}'", result.get());
+    std::println("{}", result.get());
 }
 ```
 
@@ -3783,11 +3783,10 @@ Missing std::future features makes it not composable; waiting 2 tasks to finish
 is the same as checking 2 flags to become true; giving not much of a win compared to
 direct use of CURL_async_get().
 
-See App_Futures, App_Callbacks.
+# building task API with .then() support {#then_api}
 
-# building task API with .then() support
-
-CODE: CH0x_task_basic
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH080_task_basic),
+[sample app](#app_tasks).
 
 Lets build std::future-like Task type that supports `.then()` continuations.
 
@@ -4197,8 +4196,8 @@ void Task<T>::attach_callback(Task<U>& target, F&& callback)
 };
 ```
 
-There are nuances of handling the case when callable returns `void`. Full code is in
-CH0x_task_basic.
+There are nuances of handling the case when callable returns `void`
+(see [source code](https://github.com/grishavanika/async_api_styles/tree/main/CH080_task_basic)).
 
 With that in mind, we can use Tasks like this:
 
@@ -4235,7 +4234,7 @@ is invoked instead of dummy inner task. Lets wrap CURL_async_get() to return a T
 
 ## wrapping CURL get into a Task
 
-CODE: CH0x_task_curl
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH081_task_curl).
 
 Implementing `CURL_task_get()` is trivial:
 
@@ -4308,7 +4307,7 @@ int main()
 
 ## waiting for multiple Task requests
 
-CODE: CH0x_task_many
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH082_task_many).
 
 Lets wait for N Tasks - Tasks_WhenAll():
 
@@ -4458,11 +4457,12 @@ auto Tasks_WhenAll(Task<Ts>&&... tasks)
 ```
 
 The limitations (no `Task<void>` or `Task<T&>`) could be implemented,
-but do no change the point. See the full code in CH0x_task_many.
+but do no change the point.
 
-# building C++26 senders
+# building C++26 senders {#senders_api}
 
-CODE: CH0x_senders_basic
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH090_senders_basic),
+[sample app](#app_senders).
 
 Required read: [What are Senders Good For, Anyway?](https://ericniebler.com/2024/02/04/what-are-senders-good-for-anyway/).
 
@@ -4614,7 +4614,7 @@ int main()
 
 ## sender for a CURL get
 
-CODE: CH0x_senders_curl
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH091_senders_curl).
 
 Lets adapt our simple Sender to return ("send") a std::string - i.e., what
 CURL_async_get() returns:
@@ -4905,7 +4905,8 @@ auto Senders_Main(CURL_Async curl_async)
 
 ## synchronous requests {#app_blocking}
 
-CODE: App_Blocking
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/App_Blocking),
+[API section](#libcurl_easy).
 
 For completeness, our trivial case - doing 2 GET requests sequentially:
 
@@ -4926,7 +4927,8 @@ int main()
 
 ## requests with callbacks {#app_callbacks}
 
-CODE: App_Callbacks
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/App_Callbacks),
+[API section](#libcurl_multi).
 
 With callbacks API, there are 2 variations:
 
@@ -5077,7 +5079,8 @@ static void App_CallbacksV1()
 
 ## requests with coroutines {#app_coroutines}
 
-CODE: App_Coroutines
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/App_Coroutines),
+[API section](#coro_api).
 
 SEQUENTIAL requests:
 
@@ -5133,7 +5136,8 @@ static void App_CoroutinesV1()
 
 ## requests with fibers {#app_fibers}
 
-CODE: App_Fibers
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/App_Fibers),
+[API section](#fibers_api).
 
 SEQUENTIAL requests:
 
@@ -5196,7 +5200,8 @@ static void App_FibersV1()
 
 ## polling requests with std::futures {#app_futures}
 
-CODE: App_Polling
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/App_Polling),
+[API section](#futures_api).
 
 SEQUENTIAL requests:
 
@@ -5339,7 +5344,8 @@ static void App_PollingV1()
 
 ## requests with Tasks .then() {#app_tasks}
 
-CODE: App_Tasks
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/App_Tasks),
+[API section](#then_api).
 
 SEQUENTIAL requests:
 
@@ -5401,7 +5407,8 @@ static void App_TasksV1()
 
 ## requests with senders/std::execution {#app_senders}
 
-CODE: App_Senders
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/App_Senders),
+[API section](#senders_api).
 
 SEQUENTIAL requests:
 

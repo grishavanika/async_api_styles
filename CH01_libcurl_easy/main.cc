@@ -49,5 +49,5 @@ std::string CURL_get(const std::string& url)
 int main()
 {
     const std::string r = CURL_get("localhost:5001/file1.txt");
-    std::println("CURL_get(file1.txt): '{}'", r);
+    std::println("{}", r);
 }

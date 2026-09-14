@@ -2,6 +2,7 @@
 #include <string>
 #include <functional>
 #include <unordered_map>
+#include <coroutine>
 
 #include <curl/curl.h>
 
@@ -21,6 +22,10 @@ void CURL_async_get(CURL_Async curl_async
     , const std::string& url
     , void* user_data
     , void (*callback)(void* user_data, std::string response));
+
+// coro await
+struct Co_CurlAsync;
+Co_CurlAsync CURL_await_get(CURL_Async curl_async, const std::string& url);
 
 static size_t CURL_OnWriteCallback(void* ptr, size_t size, size_t nmemb, void* data)
 {
@@ -158,27 +163,141 @@ void CURL_async_get(CURL_Async curl_async
     });
 }
 
+struct Co_Task
+{
+    struct promise_type;
+    using co_handle = std::coroutine_handle<promise_type>;
+
+    struct promise_type
+    {
+        Co_Task get_return_object()
+        {
+            return Co_Task{co_handle::from_promise(*this)};
+        }
+
+        std::suspend_always initial_suspend()
+        {
+            return {};
+        }
+
+        std::suspend_always final_suspend() noexcept
+        {
+            return {};
+        }
+
+        void return_void()
+        {
+            // yeah, we return void. Nothing to do
+        }
+       
+        void unhandled_exception()
+        {
+            // crash, no exceptions handling
+            assert(false);
+        }
+    };
+
+    Co_Task(co_handle coro)
+        : _coro{coro} {}
+    Co_Task(Co_Task&& rhs) noexcept
+        : _coro{std::exchange(rhs._coro, {})} { }
+    Co_Task(const Co_Task&) = delete;
+    ~Co_Task() noexcept
+    {
+        if (_coro)
+        {
+            _coro.destroy();
+        }
+    }
+
+    void resume()
+    {
+        assert(_coro);
+        assert(!_coro.done());
+        _coro.resume();
+    }
+
+    bool is_in_progress() const
+    {
+        assert(_coro);
+        return !_coro.done();
+    }
+
+    co_handle _coro;
+};
+
+struct Co_CurlAsync
+{
+    CURL_Async _curl_async{};
+    std::string _url;
+    std::coroutine_handle<> _coro;
+    std::string _response;
+
+    bool await_ready()
+    { // 1. CURL_async_get() is not yet started, force coroutine suspend:
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> coro)
+    { // 2. remember coroutine handle, start request, resume on finish:
+        _coro = coro;
+
+        CURL_async_get(_curl_async, _url
+            , this
+            , [](void* user_data, std::string response)
+        {
+            Co_CurlAsync& self = *static_cast<Co_CurlAsync*>(user_data);
+            self._response = std::move(response);
+            self._coro.resume();
+        });
+    }
+
+    std::string await_resume()
+    { // 3. after resume, return response:
+        return std::move(_response);
+    }
+};
+
+Co_CurlAsync CURL_await_get(CURL_Async curl_async, const std::string& url)
+{
+    Co_CurlAsync awaiter;
+    awaiter._curl_async = curl_async;
+    awaiter._url = url;
+    return awaiter;
+}
+
+static Co_Task coro_main(CURL_Async curl_async)
+{
+    const std::string response = co_await CURL_await_get(
+        curl_async, "localhost:5001/file1.txt");
+
+    std::println("{}", response);
+    co_return;
+}
+
 int main()
 {
-    struct State
-    {
-        std::string response;
-        bool done = false;
-    };
+#if (0) // set to 1 for a crash
     CURL_Async curl_async = CURL_async_create();
-    State state;
-    CURL_async_get(curl_async, "localhost:5001/file1.txt", &state
-        , [](void* user_data, std::string response)
+
     {
-        State& state_ = *static_cast<State*>(user_data);
-        state_.response = std::move(response);
-        state_.done = true;
-    });
-    while (!state.done)
+        Co_Task task = coro_main(curl_async);
+        task.resume(); // run
+    }   // **destroy**
+
+    while (true)
     {
         CURL_async_tick(curl_async);
     }
     CURL_async_destroy(curl_async);
-
-    std::println("{}", state.response);
+#else
+    CURL_Async curl_async = CURL_async_create();
+    Co_Task task = coro_main(curl_async);
+    task.resume();
+    while (task.is_in_progress())
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+#endif
 }
