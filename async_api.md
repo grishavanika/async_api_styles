@@ -4904,7 +4904,7 @@ auto Senders_Main(CURL_Async curl_async)
 
 ## senders basics: implementing then() and sync_wait() {#senders_small}
 
-[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH092_senders_simple),
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH092_senders_simple).
 
 std::execution (with stdexec) is complex, generic and handles wide range of cases.
 
@@ -5331,31 +5331,23 @@ Connecting async() with then() allows to execute a lambda on a worker thread:
 ``` cpp {.numberLines}
 int main()
 {
-    std::cout << "START, main thread id: "
-              << std::this_thread::get_id() << std::endl;
-
+    const auto main_thread_id = std::this_thread::get_id();
+    std::thread::id work_thread_id;
     auto x = then(async()
-        , [](void_t) -> void_t
+        , [&](void_t) -> void_t
     {
-        std::cout << "worker thread id: "
-                  << std::this_thread::get_id() << std::endl;
+        work_thread_id = std::this_thread::get_id();
         return {};
     });
     auto r = sync_wait(MOV(x));
     assert(r.has_value());
-
-    std::cout << "END, main thread id: "
-              << std::this_thread::get_id() << std::endl;
+    assert(main_thread_id != work_thread_id);
 }
 ```
 
-which prints:
+## senders basics: implementing when_all() {#senders_when_all}
 
-``` {.numberLines}
-START, main thread id: 28828
-     worker thread id: 31472
-  END, main thread id: 28828
-```
+[TBD]{.mark}
 
 # reactive streams
 
