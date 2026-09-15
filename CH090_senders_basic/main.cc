@@ -32,20 +32,20 @@ struct Sender
     }
 };
 
-Sender work()
+Sender CURL_get()
 {
     return Sender{};
 }
 
-stdexec::task<void> work_coro()
+stdexec::task<void> CURL_get_coro()
 {
-    co_await work();
+    co_await CURL_get();
 }
 
 int main()
 {
-    std::optional<std::tuple<>> x1 = stdexec::sync_wait(work());
+    std::optional<std::tuple<>> x1 = stdexec::sync_wait(CURL_get());
     assert(x1.has_value());
-    std::optional<std::tuple<>> x2 = stdexec::sync_wait(work_coro());
+    std::optional<std::tuple<>> x2 = stdexec::sync_wait(CURL_get_coro());
     assert(x2.has_value());
 }

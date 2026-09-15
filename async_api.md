@@ -4471,7 +4471,7 @@ a framework for managing asynchronous execution. Eric Niebler has a nice intro a
 among few other [videos](https://youtu.be/xLboNIf7BTg?si=EhiqvfhuuHWD_1Tc)
 on the topic. Some examples of senders and receivers are provided in
 [P2300R10](http://wg21.link/P2300R10). In addition, stdexec has nice
-[Developer’s Guide](https://nvidia.github.io/stdexec/developer/index.html).
+[Developer's Guide](https://nvidia.github.io/stdexec/developer/index.html).
 
 Ultimately, we'd like to write a Sender that wraps our CURL_async_get() and produces
 a response:
@@ -4500,8 +4500,9 @@ stdexec::task<void> App_Senders(CURL_Async curl_async)
 }
 ```
 
-We'll use [stdexec](https://github.com/NVIDIA/stdexec) for a start since
-writing simple senders and receivers library version is too much (probably).
+We'll use [stdexec](https://github.com/NVIDIA/stdexec) for a start. Start from
+[senders basics](#senders_small) for a simplified senders implementation.
+
 As of [2026/09/13](https://github.com/NVIDIA/stdexec/commit/ae896337cbcfc242df609585a47f9822a0b48545),
 stdexec requires at least Visual Studio 2022 version 17.13.0 (MSVC 14.43).
 
@@ -4510,16 +4511,17 @@ We start by building simplest sender that does nothing:
 ``` cpp {.numberLines}
 struct Sender
 {
+    // ...
 };
 
-Sender work()
+Sender CURL_get()
 {
     return Sender{};
 }
 
 int main()
 {
-    stdexec::sync_wait(work());
+    stdexec::sync_wait(CURL_get());
 }
 ```
 
@@ -4576,14 +4578,14 @@ where we:
 With this, we can use our Sender:
 
 ``` cpp {.numberLines}
-Sender work()
+Sender CURL_get()
 {
     return Sender{};
 }
 
 int main()
 {
-    std::optional<std::tuple<>> x = stdexec::sync_wait(work());
+    std::optional<std::tuple<>> x = stdexec::sync_wait(CURL_get());
     assert(x.has_value());
 }
 ```
@@ -4595,19 +4597,19 @@ Since Sender concept is compatible with C++20 coroutines awaitable, just impleme
 a Sender allows to use it in coroutines. So, next coroutine works just fine too:
 
 ``` cpp {.numberLines}
-Sender work()
+Sender CURL_get()
 {
     return Sender{};
 }
 
-stdexec::task<void> work_coro()
+stdexec::task<void> CURL_get_coro()
 {
-    co_await work();
+    co_await CURL_get();
 }
 
 int main()
 {
-    std::optional<std::tuple<>> x = stdexec::sync_wait(work_coro());
+    std::optional<std::tuple<>> x = stdexec::sync_wait(CURL_get_coro());
     assert(x.has_value());
 }
 ```
@@ -4679,7 +4681,8 @@ int main()
 
 Yes. But note there are 2 issues:
 
-1) sync_wait() will block execution and we'll never tick our CURL loop; and
+1) sync_wait() will block execution and we'll never tick our CURL loop;
+   (note: we probably could inject our tick logic into sync_wait run_loop);
 2) we don't know when to stop.
 
 To continue main() execution, we must remove sync_wait and manually start the Sender.
@@ -4897,6 +4900,461 @@ auto Senders_Main(CURL_Async curl_async)
             std::println("{}", r2);
         }));
 }
+```
+
+## senders basics: implementing then() and sync_wait() {#senders_small}
+
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH092_senders_simple),
+
+std::execution (with stdexec) is complex, generic and handles wide range of cases.
+
+Going with few assumptions and restrictions allows to show the core idea behind and
+implement basic version of senders and receivers. We'll assume:
+
+ - sender can only send one value T; so we have only set_value(T)
+ - sender can only fail with one value E; so we have only set_error(E)
+ - value and error is non-void type; so we don't need to branch void case
+ - no customization points
+ - no exceptions, everything is noexcept
+ - we skip advanced concepts, like domains and environments
+   (see [P2300R10](https://wg21.link/P2300R10))
+
+With that, we can start with coding the basic ideas:
+
+``` cpp {.numberLines}
+// Receiver.
+template<typename Receiver, typename T>
+void set_value(Receiver&& r, T&& v) noexcept
+{
+    FWD(r).set_value(FWD(v));
+}
+
+template<typename Receiver, typename E>
+void set_error(Receiver&& r, E&& e) noexcept
+{
+    FWD(r).set_error(FWD(e));
+}
+
+template<typename Receiver>
+void set_stopped(Receiver&& r) noexcept
+{
+    FWD(r).set_stopped();
+}
+```
+
+See, everything we can do with Receiver is those 3 things: set_value(T),
+set_error(E) and set_stopped().
+
+A note on FWD: typing `std::forward<Receiver>(r)` clutters the details; we simplify:
+
+``` cpp {.numberLines}
+#define FWD(...) ::std::forward<decltype(__VA_ARGS__)>(__VA_ARGS__)
+#define MOV(...) ::std::move(__VA_ARGS__)
+#define REMOVE_CV(...) std::remove_cv_t<__VA_ARGS__>
+using void_t = std::monostate;
+```
+
+For Sender, we define next API:
+
+``` cpp {.numberLines}
+// Sender.
+template<typename Sender, typename Receiver>
+auto connect(Sender&& s, Receiver&& r) noexcept
+{
+    return FWD(s).connect(FWD(r));
+}
+
+template<typename Sender>
+using sender_value_t = typename REMOVE_CV(Sender)::value_t;
+
+template<typename Sender>
+using sender_error_t = typename REMOVE_CV(Sender)::error_t;
+```
+
+Again, for Sender, we can only (a) connect() it to a Receiver and (b) query
+the types we would eventually send.
+
+Finishing with Operation API, we can only start():
+
+``` cpp {.numberLines}
+// Operation.
+template<typename Operation>
+void start(Operation& o) noexcept
+{
+    o.start();
+}
+```
+
+With only the pieces above, we can implement `just(v)` Sender:
+
+``` cpp {.numberLines}
+template<typename T>
+auto just(T&& v) noexcept
+{
+    return Sender_Just<REMOVE_CV(T)>{._v = FWD(v)};
+}
+```
+
+so... just() only returns a wrapper (Sender_Just) that remembers a value `v`
+we would set later. No actual work done or started. Sender_Just is:
+
+``` cpp {.numberLines}
+template<typename T>
+struct Sender_Just
+{
+    using value_t = T;
+    using error_t = void_t;
+    T _v;
+    template<typename Receiver>
+    auto connect(Receiver&& r) noexcept
+    {
+        return State_Just<REMOVE_CV(Receiver), T>{._r = FWD(r), ._v = MOV(_v)};
+    }
+};
+```
+
+where we signal that our operation would set_value() of a type T; there is no error;
+and when just Sender is connected to a Receiver, we... return the proper state
+we need; again, no actual work is done:
+
+``` cpp {.numberLines}
+template<typename Receiver, typename T>
+struct State_Just
+{
+    Receiver _r;
+    T _v;
+    void start() noexcept
+    {
+        set_value(MOV(_r), MOV(_v));
+    }
+};
+```
+
+Operation state (State_Just) is the non-movable, always alive (during operation)
+state that knows how to start the operation. For a just(1) case,
+we complete the operation immediately - by invoking set_value() on a Receiver
+and passing the value we have.
+
+One more time - Receiver could be thought as as callable/lambda. Saying:
+
+> invoking set_value() on a Receiver [...]
+
+is just a fancy way to say that we call a lambda and pass a result value to it.
+
+For now, we can't use a lambda as a Receiver directly (then() needs to be
+implemented). For a test, lets have a simple one:
+
+``` cpp {.numberLines}
+struct LogReceiver
+{
+    void set_value(auto&& v) noexcept
+    {
+        std::println("set_value({})", v);
+    }
+};
+
+int main()
+{
+    auto operation_state = connect(just(399), LogReceiver{});
+    start(operation_state); // *
+}
+```
+
+So:
+
+ - we have a just Sender
+ - we create a just Sender instance by calling `just(399)`
+ - just(399) describes a work that would be done when operation starts
+ - we connect the Sender to a specific instance of a Receiver (read "callback")
+ - connecting the Sender and the Receiver gives us Operation state back
+ - Operation state encodes all that work and data that are needed to execute
+   everything; finally
+ - we start an operation by invoking a .start() on an operation state
+
+We do not wait for operation completion in the code above because we know
+everything completes immediately, inline and we see the output:
+
+``` {.numberLines}
+set_value(399)
+```
+
+sync_wait does mostly the same under the hood. Lets implement it. sync_wait()
+accepts any Receiver, starts it, waits for it and returns the result:
+
+``` cpp {.numberLines}
+int main()
+{
+    auto x = sync_wait(just(1));
+}
+```
+
+Since any Sender, in general, can return either value T on success, error E on error
+or cancel signal (.set_stopped()), lets first write a type that can represent that:
+
+``` cpp {.numberLines}
+template<typename T, typename E>
+struct sync_wait_result : std::variant<std::monostate, T, E>
+{
+    bool was_stopped() const { return (this->index() == 0); }
+    bool has_value() const { return (this->index() == 1); }
+    bool has_error() const { return (this->index() == 2); }
+    T& value() { return std::get<1>(*this); }
+    E& error() { return std::get<2>(*this); }
+};
+```
+
+(Real stdexec::sync_wait() does it differently, mostly because errors
+are handled differently).
+
+Now, we can:
+
+``` cpp {.numberLines}
+template<typename Sender>
+auto sync_wait(Sender&& s) noexcept
+{
+    using T = sender_value_t<Sender>;
+    using E = sender_error_t<Sender>;
+    State_SyncWait<T, E> state;
+    auto o = connect(FWD(s), Receiver_SyncWait<T, E>{._state = &state});
+    start(o);
+    state.wait();
+    return state.get_once();
+}
+```
+
+See, given a Sender, we:
+
+ - query its value type (for success) and error type
+ - create our internal wait state (State_SyncWait)
+ - (note it's all local variable on the stack since we implement blocking wait); then
+ - connect a Sender with our Receiver (that knows how to notify operation end); then
+ - start an operation; finally
+ - do a blocking wait
+
+Lets check what Receiver_SyncWait does:
+
+``` cpp {.numberLines}
+template<typename T, typename E>
+struct Receiver_SyncWait
+{
+    State_SyncWait<T, E>* _state = nullptr;
+    template<typename U>
+    void set_value(U&& v) noexcept
+    {
+        _state->template emplace<1>(FWD(v));
+        _state->_done.set_value();
+    }
+    template<typename U>
+    void set_error(U&& e) noexcept
+    {
+        _state->template emplace<2>(FWD(e));
+        _state->_done.set_value();
+    }
+    void set_stopped() noexcept
+    {
+        _state->template emplace<0>();
+        _state->_done.set_value();
+    }
+};
+```
+
+It's a generic Receiver that remembers the values (by forwarding to State_SyncWait)
+and signalling done event. State_SyncWait is:
+
+``` cpp {.numberLines}
+template<typename T, typename E>
+struct State_SyncWait : sync_wait_result<T, E>
+{
+    std::promise<void> _done;
+    auto get_once()
+    {
+        return sync_wait_result<T, E>{std::move(*this)};
+    }
+    void wait()
+    {
+        _done.get_future().wait();
+    }
+};
+```
+
+which holds `sync_wait_result<T, E>` that we use to save the values/errors and
+`std::promise<void>` which we (ab)use to implement that blocking waiting.
+
+That allows to wait for any Sender:
+
+``` cpp {.numberLines}
+int main()
+{
+    auto r = sync_wait(just(4));
+    assert(r.has_value());
+    assert(r.value() == 4);
+}
+```
+
+Lets continue and implement then() - which allows to attach a lambda to a Sender
+complete event:
+
+``` cpp {.numberLines}
+int main()
+{
+    auto r = sync_wait(then(just(3)
+        , [](int v) -> void_t
+    {
+        std::println("{}", v); // prints 3
+        return {};
+    }));
+    assert(r.has_value());
+}
+```
+
+then() accepts any Sender and invokes a given lambda when that Sender completes.
+Lambda accepts the result of the Sender and returns a new value. That new value
+is what a then-sender would return. Basically, then() transforms another Sender's
+value.
+
+``` cpp {.numberLines}
+template<typename Sender, typename Lambda>
+auto then(Sender&& s, Lambda&& f) noexcept
+{
+    return Sender_Then<REMOVE_CV(Sender), REMOVE_CV(Lambda)>
+        {._s = FWD(s), ._f = FWD(f)};
+}
+```
+
+See, we return Sender_Then that remembers inner sender that we would invoke and
+a lambda that we would call:
+
+``` cpp {.numberLines}
+template<typename Sender, typename Lambda>
+struct Sender_Then
+{
+    using inner_value_t = sender_value_t<Sender>;
+    using value_t = std::invoke_result_t<Lambda, inner_value_t>;
+    using error_t = sender_error_t<Sender>;
+    Sender _s;
+    Lambda _f;
+    template<typename Receiver>
+    auto connect(Receiver&& r) noexcept
+    {
+        using Receiver_ = Receiver_Then<REMOVE_CV(Receiver), Lambda>;
+        return ::connect(MOV(_s), Receiver_{._r = FWD(r), ._f = MOV(_f)});
+    }
+};
+```
+
+Sender_Then:
+
+ - leaves error value (error_t) unchanged - the same as the original Sender since
+   we do not touch that
+ - signals that a value type we would return is the result of invoking a lambda; and
+ - on connect(), we just return original state because its so happens that
+   our then implementation does not need to store anything extra; and
+ - everything goes to our then-receiver
+
+Receiver_Then is:
+
+``` cpp {.numberLines}
+template<typename Receiver, typename Lambda>
+struct Receiver_Then
+{
+    Receiver _r;
+    Lambda _f;
+    template<typename U>
+    void set_value(U&& v) noexcept
+    {
+        ::set_value(MOV(_r), MOV(_f)(FWD(v)));
+    }
+    template<typename U>
+    void set_error(U&& e) noexcept
+    {
+        ::set_error(MOV(_r), FWD(e));
+    }
+    void set_stopped() noexcept
+    {
+        ::set_stopped(MOV(_r));
+    }
+};
+```
+
+See, set_value() just gets a value, calls a lambda and sends that to a next receiver.
+
+That's all. We are forced to return void_t since we do not support void values.
+But other then that, it's a complete implementation:
+
+``` cpp {.numberLines}
+sync_wait(then(just(3)
+    , [](int v) -> void_t
+{
+    std::println("{}", v); // prints 3
+    return {};
+}));
+```
+
+Finally, to show some async work, lets implement simple `async()` sender that
+completes the work on thread pool (using std::async):
+
+``` cpp {.numberLines}
+template<typename Receiver>
+struct State_Async
+{
+    Receiver _r;
+    std::future<void> _f;
+    void start() noexcept
+    {
+        _f = std::async(std::launch::async
+            , [r = MOV(_r)]() mutable
+        {
+            ::set_value(MOV(r), void_t());
+        });
+    }
+};
+
+struct Sender_Async
+{
+    using value_t = void_t;
+    using error_t = void_t;
+    template<typename Receiver>
+    auto connect(Receiver&& r) noexcept
+    {
+        return State_Async<REMOVE_CV(Receiver)>{._r = FWD(r)};
+    }
+};
+
+auto async()
+{
+    return Sender_Async{};
+}
+```
+
+Connecting async() with then() allows to execute a lambda on a worker thread:
+
+``` cpp {.numberLines}
+int main()
+{
+    std::cout << "START, main thread id: "
+              << std::this_thread::get_id() << std::endl;
+
+    auto x = then(async()
+        , [](void_t) -> void_t
+    {
+        std::cout << "worker thread id: "
+                  << std::this_thread::get_id() << std::endl;
+        return {};
+    });
+    auto r = sync_wait(MOV(x));
+    assert(r.has_value());
+
+    std::cout << "END, main thread id: "
+              << std::this_thread::get_id() << std::endl;
+}
+```
+
+which prints:
+
+``` {.numberLines}
+START, main thread id: 28828
+     worker thread id: 31472
+  END, main thread id: 28828
 ```
 
 # reactive streams
