@@ -5118,7 +5118,7 @@ auto sync_wait(Sender&& s) noexcept
     auto o = connect(FWD(s), Receiver_SyncWait<T, E>{._state = &state});
     start(o);
     state.wait();
-    return state.get_once();
+    return MOV(state.get());
 }
 ```
 
@@ -5166,9 +5166,9 @@ template<typename T, typename E>
 struct State_SyncWait : sync_wait_result<T, E>
 {
     std::promise<void> _done;
-    auto get_once()
+    sync_wait_result<T, E>& get()
     {
-        return sync_wait_result<T, E>{std::move(*this)};
+        return *this;
     }
     void wait()
     {
@@ -5459,7 +5459,7 @@ struct State_When_All<Receiver
         >;
     using operations_tuple_t = std::tuple<
         state_storage_t<Senders
-            , Receiver_When_All<Senders, Is, Results>
+            , Receiver_When_All<Is, Results>
             >...
         >;
     using senders_tuple = std::tuple<Senders...>;
@@ -5471,8 +5471,7 @@ struct State_When_All<Receiver
     template<auto I>
     void apply_sender()
     {
-        using Sender_ = std::tuple_element_t<I, senders_tuple>;
-        using Receiver_ = Receiver_When_All<Sender_, I, Results>;
+        using Receiver_ = Receiver_When_All<I, Results>;
 
         auto& sender = std::get<I>(_ss);
         auto& state_storage = std::get<I>(_states);
@@ -5488,7 +5487,7 @@ struct State_When_All<Receiver
 };
 ```
 
-where starting when_all() operation - starts all of the Senders - they are
+where starting when_all() operation - starts all of the Senders - they could be
 "executing" concurrently or even in parallel. We have N operations active.
 
 See how our when_all() state embeds all of the other Senders operations states
@@ -5517,7 +5516,7 @@ Note, that we need to complete our operation when only last operation ends.
 To achieve this, we have our own, custom, per-sender Receiver - Receiver_When_All:
 
 ``` cpp {.numberLines}
-using Receiver_ = Receiver_When_All<Sender_, I, Results>;
+using Receiver_ = Receiver_When_All<I, Results>;
 auto& state = state_storage.template emplace<1>(
     ::connect(MOV(sender), Receiver_{._r = &_results}));
 ::start(state);
@@ -5715,10 +5714,126 @@ int main()
 
 ## senders basics: implementing sequence()
 
-Similar to when_all(), given a set of N Senders, we need to start
-all of them one by one, in order.
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH094_senders_sequence).
 
-[TBD]{.mark}
+Similar to when_all(), given a set of N Senders, we need to start
+all of them one by one, in order. We simplify and require all of the
+Senders to return void on success and error:
+
+``` cpp {.numberLines}
+template<typename... Senders>
+auto sequence(Senders&&... ss)
+{
+    static_assert(sizeof...(Senders) >= 1);
+    static_assert(std::conjunction_v<
+          std::is_same<void_t, sender_value_t<Senders>>...>
+        , "we expect all of the Senders to return void on success");
+    static_assert(std::conjunction_v<
+          std::is_same<void_t, sender_error_t<Senders>>...>
+        , "we expect all of the Senders to return void on error");
+    return Sender_Sequence<REMOVE_CVR(Senders)...>{FWD(ss)...};
+}
+```
+
+Sender_Sequence is the same as Sender_When_All, we just return State_Sequence:
+
+``` cpp {.numberLines}
+template<...>
+struct State_Sequence
+{
+    Receiver _r;
+    senders_tuple_t _ss;
+    operations_tuple_t _states;
+
+    template<auto I>
+    void apply_sender();
+
+    void start() noexcept
+    {
+        apply_sender<0>();
+    }
+
+    void done()
+    {
+        ::set_value(MOV(_r), void_t{});
+    }
+};
+```
+
+sequence() operation start() just starts the 1st (at index 0) Sender, by invoking
+`apply_sender<0>()`. The logic of chaining - starting the next operation is
+in apply_sender(), where we start next one (I + 1), when previous completes:
+
+``` cpp {.numberLines}
+template<auto I>
+void State_Sequence::apply_sender()
+{
+    auto apply_next = [this]()
+    {
+        if constexpr ((I + 1) < sizeof...(Senders))
+        {
+            apply_sender<I + 1>();
+        }
+        else
+        {
+            done();
+        }
+    };
+
+    auto& sender = std::get<I>(_ss);
+    auto& state_storage = std::get<I>(_states);
+    auto& state = state_storage.template emplace<1>(
+        ::connect(MOV(sender)
+            , Receiver_Sequence{._finish = MOV(apply_next)}));
+    ::start(state);
+}
+```
+
+Our internal Receiver_Sequence just invokes completion callback we pass to it,
+which is apply_next():
+
+``` cpp {.numberLines}
+struct Receiver_Sequence
+{
+    std::function<void ()> _finish; // should not allocate
+    template<typename U>
+    void set_value(U&&) noexcept
+    {
+        _finish();
+    }
+    template<typename U>
+    void set_error(U&&) noexcept
+    {
+        _finish();
+    }
+    void set_stopped() noexcept
+    {
+        _finish();
+    }
+};
+```
+
+All in all, we can:
+
+``` cpp {.numberLines}
+int main()
+{
+    auto just_log = [](const char* text)
+    {
+        return then(async(), [text](void_t) -> void_t
+        {
+            std::println("{}", text);
+            return {};
+        });
+    };
+    sync_wait(sequence(just_log("one"), just_log("two")));
+}
+```
+
+## senders basics: CURL get
+
+Finally, we can implement the same CURL_sender_get() we did with stdexec,
+but using our simplified senders and receivers implementation.
 
 # reactive streams
 

@@ -479,24 +479,127 @@ auto when_all(Senders&&... ss)
     return Sender_When_All<REMOVE_CVR(Senders)...>{FWD(ss)...};
 }
 
+// sequence()
+struct Receiver_Sequence
+{
+    std::function<void ()> _finish; // should not allocate
+    template<typename U>
+    void set_value(U&&) noexcept
+    {
+        _finish();
+    }
+    template<typename U>
+    void set_error(U&&) noexcept
+    {
+        _finish();
+    }
+    void set_stopped() noexcept
+    {
+        _finish();
+    }
+};
+
+template<typename Receiver, typename SendersTuple, typename SendersIndexes>
+struct State_Sequence;
+
+template<typename Receiver, typename... Senders, auto... Is>
+struct State_Sequence<Receiver
+    , std::tuple<Senders...>
+    , std::index_sequence<Is...>
+    >
+{
+    // Could be a variant since one operation is active
+    // at a single point in time; however, it gets complicated
+    // when operation completes and destroys its own state...
+    using operations_tuple_t = std::tuple<
+        state_storage_t<Senders, Receiver_Sequence>...
+        >;
+    using senders_tuple_t = std::tuple<Senders...>;
+
+    Receiver _r;
+    senders_tuple_t _ss;
+    operations_tuple_t _states;
+
+    template<auto I>
+    void apply_sender()
+    {
+        auto apply_next = [this]()
+        {
+            if constexpr ((I + 1) < sizeof...(Senders))
+            {
+                apply_sender<I + 1>();
+            }
+            else
+            {
+                done();
+            }
+        };
+
+        auto& sender = std::get<I>(_ss);
+        auto& state_storage = std::get<I>(_states);
+        auto& state = state_storage.template emplace<1>(
+            ::connect(MOV(sender)
+                , Receiver_Sequence{._finish = MOV(apply_next)}));
+        ::start(state);
+    }
+
+    void start() noexcept
+    {
+        apply_sender<0>();
+    }
+
+    void done()
+    {
+        ::set_value(MOV(_r), void_t{});
+    }
+};
+
+template<typename... Senders>
+struct Sender_Sequence
+{
+    using value_t = void_t;
+    using error_t = void_t;
+
+    std::tuple<Senders...> _ss;
+
+    template<typename... Ss>
+    Sender_Sequence(Ss&&... ss)
+        : _ss{FWD(ss)...}
+    {
+    }
+
+    template<typename Receiver>
+    auto connect(Receiver&& r) noexcept
+    {
+        using State = State_Sequence<
+              REMOVE_CVR(Receiver)
+            , std::tuple<Senders...>
+            , std::index_sequence_for<Senders...>
+            >;
+        return State{._r = FWD(r), ._ss = MOV(_ss)};
+    }
+};
+
+template<typename... Senders>
+auto sequence(Senders&&... ss)
+{
+    static_assert(sizeof...(Senders) >= 1);
+    static_assert(std::conjunction_v<std::is_same<void_t, sender_value_t<Senders>>...>
+        , "we expect all of the Senders to return void on success");
+    static_assert(std::conjunction_v<std::is_same<void_t, sender_error_t<Senders>>...>
+        , "we expect all of the Senders to return void on error");
+    return Sender_Sequence<REMOVE_CVR(Senders)...>{FWD(ss)...};
+}
+
 int main()
 {
-    auto async_just = [](auto v)
+    auto just_log = [](const char* text)
     {
-        return then(async(), [copy = MOV(v)](void_t) mutable
+        return then(async(), [text](void_t) -> void_t
         {
-            return MOV(copy);
+            std::println("{}", text);
+            return {};
         });
     };
-    auto op = when_all(
-          async_just(6)
-        , async_just('v')
-        , just(7.2)
-        );
-    sync_wait(then(MOV(op), [](auto vs) -> void_t
-    {
-        auto [a, b, c] = vs;
-        std::println("{} {} {}", a, b, c);
-        return {};
-    }));
+    sync_wait(sequence(just_log("one"), just_log("two")));
 }
