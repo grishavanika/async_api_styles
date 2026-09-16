@@ -5352,7 +5352,7 @@ int main()
 
 [source code](https://github.com/grishavanika/async_api_styles/tree/main/CH093_senders_when_all).
 
-Lets implement when_all() senders algorithms:
+Lets implement when_all() senders algorithm (sender adaptor, per [p2300r10](https://wg21.link/P2300R10)):
 
 ``` cpp {.numberLines}
 int main()
@@ -5392,6 +5392,331 @@ Real stdexec implementation cancels all of the senders yet-in-progress when firs
 error or cancel arrives. For our simplified senders implementation, cancellation
 is not implemented so we do nothing and simply ensure all of the senders/operations
 complete (as if cancelled, but none of the senders support cancellation).
+
+Handling variadic set of Senders, each of which could send different types for
+values and errors is a bit noisy, but lets start with when_all():
+
+``` cpp {.numberLines}
+template<typename... Senders>
+auto when_all(Senders&&... ss)
+{
+    static_assert(sizeof...(Senders) >= 1);
+    return Sender_When_All<REMOVE_CV(Senders)...>{FWD(ss)...};
+}
+```
+
+where we accept one or more Senders, construct our Sender wrapper - Sender_When_All - 
+which remembers all the Senders, since we need to start them later:
+
+``` cpp {.numberLines}
+template<typename... Senders>
+struct Sender_When_All
+{
+    using value_t = std::tuple<sender_value_t<Senders>...>;
+    using error_t = std::variant<sender_error_t<Senders>...>;
+
+    std::tuple<Senders...> _ss;
+
+    template<typename... Ss>
+    Sender_When_All(Ss&&... ss)
+        : _ss{FWD(ss)...}
+    {
+    }
+
+    template<typename Receiver>
+    auto connect(Receiver&& r) noexcept
+    {
+        using State = State_When_All<
+              REMOVE_CV(Receiver)
+            , std::tuple<Senders...>
+            , std::index_sequence_for<Senders...>
+            >;
+        return State{._results{._r = FWD(r)}, ._ss{MOV(_ss)}};
+    }
+};
+```
+
+Sender_When_All does:
+
+ - propagate its set_value() type which is a tuple of all of the Senders values
+ - propagate its set_error() type (a variant of errors)
+ - remember all of the Senders - to be passed later, on connect()
+
+connect() of our when_all() Sender just returns the (operation) state
+- State_When_All:
+
+``` cpp {.numberLines}
+template<typename Receiver, typename... Senders, auto... Is>
+struct State_When_All<Receiver
+    , std::tuple<Senders...>     // Senders tuple
+    , std::index_sequence<Is...> // Senders indexes
+    >
+{
+    using Results = Result_When_All<
+          Receiver
+        , std::index_sequence<Is...>
+        , Senders...
+        >;
+    using operations_tuple_t = std::tuple<
+        state_storage_t<Senders
+            , Receiver_When_All<Senders, Is, Results>
+            >...
+        >;
+    using senders_tuple = std::tuple<Senders...>;
+
+    Results _results;
+    senders_tuple _ss;
+    operations_tuple_t _states;
+
+    template<auto I>
+    void apply_sender()
+    {
+        using Sender_ = std::tuple_element_t<I, senders_tuple>;
+        using Receiver_ = Receiver_When_All<Sender_, I, Results>;
+
+        auto& sender = std::get<I>(_ss);
+        auto& state_storage = std::get<I>(_states);
+        auto& state = state_storage.template emplace<1>(
+            ::connect(MOV(sender), Receiver_{._r = &_results}));
+        ::start(state);
+    }
+
+    void start() noexcept
+    {
+        (apply_sender<Is>(), ...);
+    }
+};
+```
+
+where starting when_all() operation - starts all of the Senders - they are
+"executing" concurrently or even in parallel. We have N operations active.
+
+See how our when_all() state embeds all of the other Senders operations states
+inline - everything is known at compile time:
+
+``` cpp {.numberLines}
+template<typename Sender, typename Receiver>
+using operation_state_t = decltype(::connect(
+    std::declval<Sender>(), std::declval<Receiver>()));
+
+// To handle non-default-constructible states.
+template<typename Sender, typename Receiver>
+using state_storage_t = std::variant<std::monostate
+    , operation_state_t<Sender, Receiver>>;
+
+using operations_tuple_t = std::tuple<
+    state_storage_t<Senders
+        , Receiver_When_All<Senders, Is, Results>
+        >...
+    >;
+
+operations_tuple_t _states;
+```
+
+Note, that we need to complete our operation when only last operation ends.
+To achieve this, we have our own, custom, per-sender Receiver - Receiver_When_All:
+
+``` cpp {.numberLines}
+using Receiver_ = Receiver_When_All<Sender_, I, Results>;
+auto& state = state_storage.template emplace<1>(
+    ::connect(MOV(sender), Receiver_{._r = &_results}));
+::start(state);
+```
+
+so when one of the Senders completes, we notify shared results that given operation
+(indexed by I) is done:
+
+``` cpp {.numberLines}
+template<typename Sender, auto I, typename Results>
+struct Receiver_When_All
+{
+    Results* _r = nullptr;
+
+    template<typename U>
+    void set_value(U&& v) noexcept
+    {
+        _r->template set_value<I>(FWD(v));
+    }
+    template<typename U>
+    void set_error(U&& e) noexcept
+    {
+        _r->template set_error<I>(FWD(e));
+    }
+    void set_stopped() noexcept
+    {
+        _r->template set_stopped<I>();
+    }
+};
+```
+
+Results must be shared since we count completed operations:
+
+``` cpp {.numberLines}
+template<typename Receiver, auto... Is, typename... Senders>
+struct Result_When_All<Receiver, std::index_sequence<Is...>, Senders...>
+{
+    using Results = std::tuple<
+        sync_wait_result<
+              sender_value_t<Senders>
+            , sender_error_t<Senders>
+            >...
+        >;
+    std::mutex _lock;
+    Receiver _r;
+    Results _rs;
+    bool _has_error = false;
+    bool _was_stopped = false;
+    std::int32_t _count = sizeof...(Senders);
+
+    template<auto I, typename U>
+    void set_value(U&& v) noexcept
+    {
+        std::lock_guard _(_lock);
+        if ((_has_error || _was_stopped) == false)
+        {
+            std::get<I>(_rs).set_value(FWD(v));
+        }
+        try_finish();
+    }
+    template<auto I, typename U>
+    void set_error(U&& e) noexcept
+    {
+        std::lock_guard _(_lock);
+        if ((_has_error || _was_stopped) == false)
+        {
+            std::get<I>(_rs).set_error(FWD(e));
+            _has_error = true;
+            // real when_all() - also cancels the rest
+        }
+        try_finish();
+    }
+    template<auto I>
+    void set_stopped() noexcept
+    {
+        std::lock_guard _(_lock);
+        if ((_has_error || _was_stopped) == false)
+        {
+            std::get<I>(_rs).set_stopped();
+            _was_stopped = true;
+            // real when_all() - also cancels the rest
+        }
+        try_finish();
+    }
+    // ...
+};
+```
+
+see, when I(th) operation completes with success, we invoke `set_value<I>()` which
+remembers the value to final tuple of all of the results. In addition:
+
+ - when error or cancel/stop was already done, we skip set_value
+ - for set_error(), we remember the error once
+ - same for a stop.
+
+Note, how set_error(), set_value() and set_stopped() could be
+invoked all at the same time since we could have potentially truly parallel
+operations that complete all at once. Since all of them access same, shared state,
+we do need to have some kind of lock guard in place.
+
+Finally, try_finish() decrements operations in progress and completes when 
+last operation completes (`_count == 0`):
+
+``` cpp {.numberLines}
+void Result_When_All::try_finish()
+{
+    _count -= 1;
+    assert(_count >= 0);
+    if (_count == 0)
+    {
+        finish();
+    }
+}
+
+void Result_When_All::finish()
+{
+    if (_was_stopped)
+    {
+        ::set_stopped(MOV(_r));
+    }
+    else if (_has_error)
+    {
+        std::variant<sender_error_t<Senders>...> es;
+        ((std::get<Is>(_rs).has_error()
+            ? (void)es.template emplace<Is>(
+                MOV(std::get<Is>(_rs).error()))
+            : (void)0
+            ), ...);
+        ::set_error(MOV(_r), MOV(es));
+    }
+    else
+    {
+        ::set_value(MOV(_r)
+            , std::tuple<sender_value_t<Senders>...>(
+                std::get<Is>(_rs).value()...
+                )
+            );
+    }
+}
+```
+
+Handling templates a bit obfuscates the code, but overall:
+
+ - if any Sender was stopped, with complete with set_stopped()
+ - if there was an Error, we construct our error variant (with a proper index)
+   and complete with set_error(); finally
+ - when everything completed successfully, we construct a tuple of all of
+   the results and invoke set_value() on our target Receiver.
+
+That allows to wait for N operations:
+
+``` cpp {.numberLines}
+int main()
+{
+    auto async_just = [](auto v)
+    {
+        return then(async(), [copy = MOV(v)](void_t) mutable
+        {
+            return MOV(copy);
+        });
+    };
+    auto op = when_all(
+          async_just(6)
+        , async_just('v')
+        , just(7.2)
+        );
+    sync_wait(then(MOV(op), [](auto vs) -> void_t
+    {
+        auto [a, b, c] = vs;
+        std::println("{} {} {}", a, b, c);
+        return {};
+    }));
+}
+```
+
+(See how we composed async() and then() to create async_just() sender that completes
+on a worker thread).
+
+In addition, the code for this section implements just_error() and just_stopped()
+that are identical to just(), but complete with set_error() and set_stopped().
+
+``` cpp {.numberLines}
+int main()
+{
+    auto r = sync_wait(when_all(
+          just(1)
+        , just_error('x')
+        ));
+    assert(r.has_error());
+    auto e = r.error();
+    assert(e.index() == 1);
+    assert(std::get<1>(e) == 'x');
+}
+```
+
+## senders basics: implementing sequence()
+
+Similar to when_all(), given a set of N Senders, we need to start
+all of them one by one, in order.
 
 [TBD]{.mark}
 

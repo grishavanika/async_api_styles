@@ -81,6 +81,65 @@ auto just(T&& v) noexcept
     return Sender_Just<REMOVE_CV(T)>{._v = FWD(v)};
 }
 
+// just_error('x')
+template<typename Receiver, typename E>
+struct State_Just_Error
+{
+    Receiver _r;
+    E _e;
+    void start() noexcept
+    {
+        ::set_error(MOV(_r), MOV(_e));
+    }
+};
+
+template<typename E>
+struct Sender_Just_Error
+{
+    using value_t = void_t;
+    using error_t = E;
+    E _e;
+    template<typename Receiver>
+    auto connect(Receiver&& r) noexcept
+    {
+        return State_Just_Error<REMOVE_CV(Receiver), E>{._r = FWD(r), ._e = MOV(_e)};
+    }
+};
+
+template<typename E>
+auto just_error(E&& e) noexcept
+{
+    return Sender_Just_Error<REMOVE_CV(E)>{._e = FWD(e)};
+}
+
+// just_stopped()
+template<typename Receiver>
+struct State_Just_Stopped
+{
+    Receiver _r;
+    void start() noexcept
+    {
+        ::set_stopped(MOV(_r));
+    }
+};
+
+struct Sender_Just_Stopped
+{
+    using value_t = void_t;
+    using error_t = void_t;
+
+    template<typename Receiver>
+    auto connect(Receiver&& r) noexcept
+    {
+        return State_Just_Stopped<REMOVE_CV(Receiver)>{._r = FWD(r)};
+    }
+};
+
+auto just_stopped() noexcept
+{
+    return Sender_Just_Stopped{};
+}
+
 // sync_wait(just(1))
 template<typename T, typename E>
 struct sync_wait_result : std::variant<std::monostate, T, E>
@@ -235,6 +294,7 @@ struct Result_When_All<Receiver, std::index_sequence<Is...>, Senders...>
             , sender_error_t<Senders>
             >...
         >;
+    std::mutex _lock;
     Receiver _r;
     Results _rs;
     bool _has_error = false;
@@ -244,6 +304,7 @@ struct Result_When_All<Receiver, std::index_sequence<Is...>, Senders...>
     template<auto I, typename U>
     void set_value(U&& v) noexcept
     {
+        std::lock_guard _(_lock);
         if ((_has_error || _was_stopped) == false)
         {
             std::get<I>(_rs).set_value(FWD(v));
@@ -253,6 +314,7 @@ struct Result_When_All<Receiver, std::index_sequence<Is...>, Senders...>
     template<auto I, typename U>
     void set_error(U&& e) noexcept
     {
+        std::lock_guard _(_lock);
         if ((_has_error || _was_stopped) == false)
         {
             std::get<I>(_rs).set_error(FWD(e));
@@ -264,6 +326,7 @@ struct Result_When_All<Receiver, std::index_sequence<Is...>, Senders...>
     template<auto I>
     void set_stopped() noexcept
     {
+        std::lock_guard _(_lock);
         if ((_has_error || _was_stopped) == false)
         {
             std::get<I>(_rs).set_stopped();
@@ -298,7 +361,6 @@ struct Result_When_All<Receiver, std::index_sequence<Is...>, Senders...>
                 : (void)0
                 ), ...);
             ::set_error(MOV(_r), MOV(es));
-            return;
         }
         else
         {
@@ -336,6 +398,7 @@ template<typename Sender, typename Receiver>
 using operation_state_t = decltype(::connect(
     std::declval<Sender>(), std::declval<Receiver>()));
 
+// To handle non-default-constructible states.
 template<typename Sender, typename Receiver>
 using state_storage_t = std::variant<std::monostate
     , operation_state_t<Sender, Receiver>>;
