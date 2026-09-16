@@ -4950,7 +4950,7 @@ A note on FWD: typing `std::forward<Receiver>(r)` clutters the details; we simpl
 ``` cpp {.numberLines}
 #define FWD(...) ::std::forward<decltype(__VA_ARGS__)>(__VA_ARGS__)
 #define MOV(...) ::std::move(__VA_ARGS__)
-#define REMOVE_CV(...) std::remove_cv_t<__VA_ARGS__>
+#define REMOVE_CVR(...) std::remove_cvref_t<__VA_ARGS__>
 using void_t = std::monostate;
 ```
 
@@ -4965,10 +4965,10 @@ auto connect(Sender&& s, Receiver&& r) noexcept
 }
 
 template<typename Sender>
-using sender_value_t = typename REMOVE_CV(Sender)::value_t;
+using sender_value_t = typename REMOVE_CVR(Sender)::value_t;
 
 template<typename Sender>
-using sender_error_t = typename REMOVE_CV(Sender)::error_t;
+using sender_error_t = typename REMOVE_CVR(Sender)::error_t;
 ```
 
 Again, for Sender, we can only (a) connect() it to a Receiver and (b) query
@@ -4991,7 +4991,7 @@ With only the pieces above, we can implement `just(v)` Sender:
 template<typename T>
 auto just(T&& v) noexcept
 {
-    return Sender_Just<REMOVE_CV(T)>{._v = FWD(v)};
+    return Sender_Just<REMOVE_CVR(T)>{._v = FWD(v)};
 }
 ```
 
@@ -5008,7 +5008,7 @@ struct Sender_Just
     template<typename Receiver>
     auto connect(Receiver&& r) noexcept
     {
-        return State_Just<REMOVE_CV(Receiver), T>{._r = FWD(r), ._v = MOV(_v)};
+        return State_Just<REMOVE_CVR(Receiver), T>{._r = FWD(r), ._v = MOV(_v)};
     }
 };
 ```
@@ -5216,7 +5216,7 @@ value.
 template<typename Sender, typename Lambda>
 auto then(Sender&& s, Lambda&& f) noexcept
 {
-    return Sender_Then<REMOVE_CV(Sender), REMOVE_CV(Lambda)>
+    return Sender_Then<REMOVE_CVR(Sender), REMOVE_CVR(Lambda)>
         {._s = FWD(s), ._f = FWD(f)};
 }
 ```
@@ -5236,7 +5236,7 @@ struct Sender_Then
     template<typename Receiver>
     auto connect(Receiver&& r) noexcept
     {
-        using Receiver_ = Receiver_Then<REMOVE_CV(Receiver), Lambda>;
+        using Receiver_ = Receiver_Then<REMOVE_CVR(Receiver), Lambda>;
         return ::connect(MOV(_s), Receiver_{._r = FWD(r), ._f = MOV(_f)});
     }
 };
@@ -5316,7 +5316,7 @@ struct Sender_Async
     template<typename Receiver>
     auto connect(Receiver&& r) noexcept
     {
-        return State_Async<REMOVE_CV(Receiver)>{._r = FWD(r)};
+        return State_Async<REMOVE_CVR(Receiver)>{._r = FWD(r)};
     }
 };
 
@@ -5401,7 +5401,7 @@ template<typename... Senders>
 auto when_all(Senders&&... ss)
 {
     static_assert(sizeof...(Senders) >= 1);
-    return Sender_When_All<REMOVE_CV(Senders)...>{FWD(ss)...};
+    return Sender_When_All<REMOVE_CVR(Senders)...>{FWD(ss)...};
 }
 ```
 
@@ -5427,7 +5427,7 @@ struct Sender_When_All
     auto connect(Receiver&& r) noexcept
     {
         using State = State_When_All<
-              REMOVE_CV(Receiver)
+              REMOVE_CVR(Receiver)
             , std::tuple<Senders...>
             , std::index_sequence_for<Senders...>
             >;
