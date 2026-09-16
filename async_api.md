@@ -4915,8 +4915,8 @@ implement basic version of senders and receivers. We'll assume:
  - sender can only fail with one value E; so we have only set_error(E)
  - value and error is non-void type; so we don't need to branch void case
  - no customization points
- - no exceptions, everything is noexcept
- - we skip advanced concepts, like domains and environments
+ - no exceptions, everything is noexcept (including user-defined lambdas)
+ - we skip advanced concepts, like domains, environments and cancellation
    (see [P2300R10](https://wg21.link/P2300R10))
 
 With that, we can start with coding the basic ideas:
@@ -5326,6 +5326,9 @@ auto async()
 }
 ```
 
+`std::async()` there is just for illustrative purpose, has nothing to do with senders
+and unused everywhere else.
+
 Connecting async() with then() allows to execute a lambda on a worker thread:
 
 ``` cpp {.numberLines}
@@ -5346,6 +5349,49 @@ int main()
 ```
 
 ## senders basics: implementing when_all() {#senders_when_all}
+
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH093_senders_when_all).
+
+Lets implement when_all() senders algorithms:
+
+``` cpp {.numberLines}
+int main()
+{
+    auto op = when_all(
+          just(6)
+        , just('v')
+        , just(7.2)
+        );
+    sync_wait(then(MOV(op), [](auto vs) -> void_t
+    {
+        auto [a, b, c] = vs;
+        std::println("{} {} {}", a, b, c);
+        return {};
+    }));
+}
+```
+
+Conceptually, we are given a set of N senders and we:
+
+ 1. start all of them at once;
+ 2. wait for completion of every sender/operation; and
+ 3. finish once everything is done.
+
+Given N senders, we are going to have N values at the end, so we return a tuple
+of all of the values in a successful case - `std::tuple<int, char, double>` for an
+example above.
+
+What happens when one of the senders fails? We just return this first error
+and discard all of the results. Since we store one error value, but there are N
+error types, we return `std::variant<E1, E2, ...>`.
+
+Similarly, when one of the senders is cancelled and we receive set_stopped(),
+we finish with set_stopped() too, discarding/ignoring all of the values.
+
+Real stdexec implementation cancels all of the senders yet-in-progress when first
+error or cancel arrives. For our simplified senders implementation, cancellation
+is not implemented so we do nothing and simply ensure all of the senders/operations
+complete (as if cancelled, but none of the senders support cancellation).
 
 [TBD]{.mark}
 
