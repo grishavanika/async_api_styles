@@ -5712,13 +5712,14 @@ int main()
 }
 ```
 
-## senders basics: implementing sequence()
+## senders basics: implementing sequence() {#senders_sequence}
 
 [source code](https://github.com/grishavanika/async_api_styles/tree/main/CH094_senders_sequence).
 
 Similar to when_all(), given a set of N Senders, we need to start
 all of them one by one, in order. We simplify and require all of the
-Senders to return void on success and error:
+Senders to return void on success and error; when one of the Senders fails or
+is cancelled, we fail or cancel whole sequence:
 
 ``` cpp {.numberLines}
 template<typename... Senders>
@@ -5752,11 +5753,6 @@ struct State_Sequence
     {
         apply_sender<0>();
     }
-
-    void done()
-    {
-        ::set_value(MOV(_r), void_t{});
-    }
 };
 ```
 
@@ -5768,15 +5764,23 @@ in apply_sender(), where we start next one (I + 1), when previous completes:
 template<auto I>
 void State_Sequence::apply_sender()
 {
-    auto apply_next = [this]()
+    auto apply_next = [this](sync_wait_result<void_t, void_t> v)
     {
-        if constexpr ((I + 1) < sizeof...(Senders))
+        if (v.has_error())
         {
-            apply_sender<I + 1>();
+            ::set_error(MOV(_r), MOV(v.error()));
+        }
+        else if (v.was_stopped())
+        {
+            ::set_stopped(MOV(_r));
+        }
+        else if constexpr ((I + 1) >= sizeof...(Senders))
+        {
+            ::set_value(MOV(_r), MOV(v.value()));
         }
         else
         {
-            done();
+            apply_sender<I + 1>();
         }
     };
 
@@ -5790,28 +5794,40 @@ void State_Sequence::apply_sender()
 ```
 
 Our internal Receiver_Sequence just invokes completion callback we pass to it,
-which is apply_next():
+which is our apply_next():
 
 ``` cpp {.numberLines}
 struct Receiver_Sequence
 {
-    std::function<void ()> _finish; // should not allocate
+    using R = sync_wait_result<void_t, void_t>;
+    // Should not allocate due to SBO.
+    std::function<void (R)> _finish;
     template<typename U>
-    void set_value(U&&) noexcept
+    void set_value(U&& v) noexcept
     {
-        _finish();
+        R r;
+        r.set_value(MOV(v));
+        _finish(MOV(r));
     }
     template<typename U>
-    void set_error(U&&) noexcept
+    void set_error(U&& e) noexcept
     {
-        _finish();
+        R r;
+        r.set_error(MOV(e));
+        _finish(MOV(r));
     }
     void set_stopped() noexcept
     {
-        _finish();
+        R r;
+        r.set_stopped();
+        _finish(MOV(r));
     }
 };
 ```
+
+There are issues with this simplified implementation, like, for instance,
+it's possible to stack-overflow when all of the Senders finish inline and we start
+next Sender.
 
 All in all, we can:
 
@@ -5826,14 +5842,155 @@ int main()
             return {};
         });
     };
-    sync_wait(sequence(just_log("one"), just_log("two")));
+    sync_wait(sequence(
+          just_log("one")
+        , just_log("two")
+        , just_error(void_t{})
+        , just_log("three"))
+        );
 }
 ```
 
-## senders basics: CURL get
+which prints:
+
+``` {.numberLines}
+one
+two
+```
+
+## senders basics: CURL get {#senders_CURLv2}
+
+[source code](https://github.com/grishavanika/async_api_styles/tree/main/CH095_senders_curlv2).
 
 Finally, we can implement the same CURL_sender_get() we did with stdexec,
 but using our simplified senders and receivers implementation.
+
+``` cpp {.numberLines}
+template<typename Receiver>
+struct State_CURL_Get
+{
+    void start() noexcept
+    {
+        assert(_curl_async);
+        CURL_async_get(_curl_async, _url
+            , this
+            , [](void* user_data, std::string response)
+        {
+            State_CURL_Get& state =
+                *static_cast<State_CURL_Get*>(user_data);
+            ::set_value(MOV(state._receiver), MOV(response));
+        });
+    }
+
+    Receiver _receiver;
+    CURL_Async _curl_async = nullptr;
+    std::string _url;
+};
+
+struct Sender_CURL_Get
+{
+    using value_t = std::string;
+    using error_t = void_t;
+
+    CURL_Async _curl_async = nullptr;
+    std::string _url;
+
+    template<typename Receiver>
+    auto connect(Receiver&& r)
+    {
+        return State_CURL_Get<REMOVE_CVR(Receiver)>
+        {
+            ._receiver = FWD(r),
+            ._curl_async = _curl_async,
+            ._url = std::move(_url)
+        };
+    }
+};
+
+Sender_CURL_Get CURL_sender_get(CURL_Async curl_async, const std::string& url)
+{
+    return Sender_CURL_Get
+    {
+        ._curl_async = curl_async,
+        ._url = url
+    };
+}
+
+auto App_SendersV0(CURL_Async curl_async)
+{
+    return sequence(
+        then(CURL_sender_get(curl_async, "localhost:5001/file1.txt")
+            , [](std::string r1) -> void_t
+        {
+            std::println("{}", r1);
+            return {};
+        }),
+        then(CURL_sender_get(curl_async, "localhost:5001/file2.txt")
+            , [](std::string r2) -> void_t
+        {
+            std::println("{}", r2);
+            return {};
+        })
+        );
+}
+
+auto App_SendersV1(CURL_Async curl_async)
+{
+    return then(
+        when_all(
+              CURL_sender_get(curl_async, "localhost:5001/file1.txt")
+            , CURL_sender_get(curl_async, "localhost:5001/file2.txt")
+            )
+        , [](auto vs) -> void_t
+        {
+            auto [r1, r2] = vs;
+            std::println("{}", r1);
+            std::println("{}", r2);
+            return void_t{};
+        });
+}
+
+struct AnyReceiver
+{
+    template<typename T>
+    void set_value(T&&...) noexcept { finish(); }
+    template<typename E>
+    void set_error(E&&) noexcept    { finish(); }
+    void set_stopped() noexcept     { finish(); }
+
+    void finish() noexcept
+    {
+        assert(_done);
+        assert(*_done == false);
+        *_done = true;
+    }
+
+    bool* _done = nullptr;
+};
+
+int main()
+{
+    CURL_Async curl_async = CURL_async_create();
+
+    bool done1 = false;
+    auto state1 = ::connect(App_SendersV0(curl_async), AnyReceiver{&done1});
+    ::start(state1);
+
+    bool done2 = false;
+    auto state2 = ::connect(App_SendersV1(curl_async), AnyReceiver{&done2});
+    ::start(state2);
+
+    while ((done1 == false)
+        || (done2 == false))
+    {
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
+}
+```
+
+See [requests with senders/std::execution](#app_senders) for comparison with
+stdexec.
 
 # reactive streams
 
@@ -6345,6 +6502,9 @@ static void App_TasksV1()
 
 [source code](https://github.com/grishavanika/async_api_styles/tree/main/App_Senders),
 [API section](#senders_api).
+
+See the same code done without stdexec, just basic senders and receivers
+implementation: [senders basics: CURL get](#senders_CURLv2).
 
 SEQUENTIAL requests:
 

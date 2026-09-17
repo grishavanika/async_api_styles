@@ -1,10 +1,166 @@
+#include <print>
+#include <string>
+#include <functional>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <future>
 #include <type_traits>
-#include <print>
 
+#include <curl/curl.h>
+
+#if defined(NDEBUG)
+#  undef NDEBUG
+#endif
 #include <cassert>
+
+// libcurl bookkeeping
+using CURL_Async = void*;
+CURL_Async CURL_async_create();
+void CURL_async_destroy(CURL_Async curl_async);
+void CURL_async_tick(CURL_Async curl_async);
+
+// main async callback API
+void CURL_async_get(CURL_Async curl_async
+    , const std::string& url
+    , void* user_data
+    , void (*callback)(void* user_data, std::string response));
+
+static size_t CURL_OnWriteCallback(void* ptr, size_t size, size_t nmemb, void* data)
+{
+    std::string& response = *static_cast<std::string*>(data);
+    response.append(static_cast<const char*>(ptr), size * nmemb);
+    return (size * nmemb);
+}
+
+struct CURL_AsyncScheduler
+{
+    CURL_AsyncScheduler();
+    ~CURL_AsyncScheduler();
+    // no copy, no move
+    CURL_AsyncScheduler(const CURL_AsyncScheduler&) = delete;
+
+    using Callback = std::function<void (CURL* curl_easy)>;
+
+    void tick();
+    void add_request(CURL* curl_easy, Callback on_finish);
+
+    // our state
+    CURLM* _multi_curl = nullptr;
+    std::unordered_map<CURL*, Callback> _curl_to_callback;
+};
+
+CURL_AsyncScheduler::CURL_AsyncScheduler()
+{
+    const CURLcode status = curl_global_init(CURL_GLOBAL_ALL);
+    assert(status == CURLE_OK);
+    _multi_curl = curl_multi_init();
+    assert(_multi_curl);
+}
+
+CURL_AsyncScheduler::~CURL_AsyncScheduler()
+{
+    const CURLMcode status = curl_multi_cleanup(_multi_curl);
+    assert(status == CURLM_OK);
+    curl_global_cleanup();
+}
+
+void CURL_AsyncScheduler::tick()
+{
+    int running_handles = -1;
+    CURLMcode status = curl_multi_perform(_multi_curl, &running_handles);
+    assert(status == CURLM_OK);
+    int msgs_in_queue = 0;
+    while (CURLMsg* m = curl_multi_info_read(_multi_curl, &msgs_in_queue))
+    {
+        if (m->msg != CURLMSG_DONE)
+        {
+            continue;
+        }
+        CURL* curl_easy = m->easy_handle;
+        assert(curl_easy);
+        status = curl_multi_remove_handle(_multi_curl, curl_easy);
+        assert(status == CURLM_OK);
+        auto it = _curl_to_callback.find(curl_easy);
+        assert(it != _curl_to_callback.end());
+        Callback callback = std::move(it->second);
+        assert(callback);
+        (void)_curl_to_callback.erase(it);
+        callback(curl_easy);
+    }
+}
+
+void CURL_AsyncScheduler::add_request(CURL* curl_easy, Callback on_finish)
+{
+    assert(on_finish);
+    assert(curl_easy);
+    assert(!_curl_to_callback.contains(curl_easy));
+    const CURLMcode status = curl_multi_add_handle(_multi_curl, curl_easy);
+    assert(status == CURLM_OK);
+    _curl_to_callback[curl_easy] = std::move(on_finish);
+}
+
+CURL_Async CURL_async_create()
+{
+    CURL_AsyncScheduler* scheduler = new(std::nothrow) CURL_AsyncScheduler();
+    assert(scheduler);
+    return scheduler;
+}
+
+void CURL_async_destroy(CURL_Async curl_async)
+{
+    assert(curl_async);
+    CURL_AsyncScheduler* scheduler = static_cast<CURL_AsyncScheduler*>(curl_async);
+    delete scheduler;
+}
+
+static CURL_AsyncScheduler& CURL_scheduler(CURL_Async curl_async)
+{
+    CURL_AsyncScheduler* scheduler = static_cast<CURL_AsyncScheduler*>(curl_async);
+    assert(scheduler);
+    return *scheduler;
+}
+
+void CURL_async_tick(CURL_Async curl_async)
+{
+    CURL_scheduler(curl_async).tick();
+}
+
+void CURL_async_get(CURL_Async curl_async
+    , const std::string& url
+    , void* user_data
+    , void (*callback)(void* user_data, std::string response))
+{
+    // 1. setup curl easy handle
+    CURL* curl_easy = curl_easy_init();
+    assert(curl_easy);
+    CURLcode status = curl_easy_setopt(curl_easy, CURLOPT_URL, url.c_str());
+    assert(status == CURLE_OK);
+    status = curl_easy_setopt(curl_easy, CURLOPT_FOLLOWLOCATION, 1L);
+    assert(status == CURLE_OK);
+    
+    // 2. write response data to separate std::string
+    std::string* state = new(std::nothrow) std::string{};
+    assert(state);
+    status = curl_easy_setopt(curl_easy, CURLOPT_WRITEFUNCTION, CURL_OnWriteCallback);
+    assert(status == CURLE_OK);
+    status = curl_easy_setopt(curl_easy, CURLOPT_WRITEDATA, state);
+    assert(status == CURLE_OK);
+
+    // 3. associate with multi handle/event loop
+    CURL_scheduler(curl_async).add_request(curl_easy
+        , [state, user_data, callback](CURL* curl_easy_)
+    {
+        long response_code = -1;
+        const CURLcode status_ = curl_easy_getinfo(curl_easy_, CURLINFO_RESPONSE_CODE, &response_code);
+        assert(status_ == CURLE_OK);
+        assert(response_code == 200L && "RUN serve.cmd");
+        curl_easy_cleanup(curl_easy_);
+        std::string data = std::move(*state);
+        delete state;
+        callback(user_data, std::move(data));
+    });
+}
 
 #define FWD(...) ::std::forward<decltype(__VA_ARGS__)>(__VA_ARGS__)
 #define MOV(...) ::std::move(__VA_ARGS__)
@@ -247,38 +403,6 @@ template<typename Sender, typename Lambda>
 auto then(Sender&& s, Lambda&& f) noexcept
 {
     return Sender_Then<REMOVE_CVR(Sender), REMOVE_CVR(Lambda)>{._s = FWD(s), ._f = FWD(f)};
-}
-
-// async()
-template<typename Receiver>
-struct State_Async
-{
-    Receiver _r;
-    std::future<void> _f;
-    void start() noexcept
-    {
-        _f = std::async(std::launch::async
-            , [r = MOV(_r)]() mutable
-        {
-            ::set_value(MOV(r), void_t());
-        });
-    }
-};
-
-struct Sender_Async
-{
-    using value_t = void_t;
-    using error_t = void_t;
-    template<typename Receiver>
-    auto connect(Receiver&& r) noexcept
-    {
-        return State_Async<REMOVE_CVR(Receiver)>{._r = FWD(r)};
-    }
-};
-
-auto async()
-{
-    return Sender_Async{};
 }
 
 // when_all()
@@ -602,20 +726,123 @@ auto sequence(Senders&&... ss)
     return Sender_Sequence<REMOVE_CVR(Senders)...>{FWD(ss)...};
 }
 
+template<typename Receiver>
+struct State_CURL_Get
+{
+    void start() noexcept
+    {
+        assert(_curl_async);
+        CURL_async_get(_curl_async, _url
+            , this
+            , [](void* user_data, std::string response)
+        {
+            State_CURL_Get& state = *static_cast<State_CURL_Get*>(user_data);
+            ::set_value(MOV(state._receiver), MOV(response));
+        });
+    }
+
+    Receiver _receiver;
+    CURL_Async _curl_async = nullptr;
+    std::string _url;
+};
+
+struct Sender_CURL_Get
+{
+    using value_t = std::string;
+    using error_t = void_t;
+
+    CURL_Async _curl_async = nullptr;
+    std::string _url;
+
+    template<typename Receiver>
+    auto connect(Receiver&& r)
+    {
+        return State_CURL_Get<REMOVE_CVR(Receiver)>
+        {
+            ._receiver = FWD(r),
+            ._curl_async = _curl_async,
+            ._url = std::move(_url)
+        };
+    }
+};
+
+Sender_CURL_Get CURL_sender_get(CURL_Async curl_async, const std::string& url)
+{
+    return Sender_CURL_Get
+    {
+        ._curl_async = curl_async,
+        ._url = url
+    };
+}
+
+auto App_SendersV0(CURL_Async curl_async)
+{
+    return sequence(
+        then(CURL_sender_get(curl_async, "localhost:5001/file1.txt")
+            , [](std::string r1) -> void_t
+        {
+            std::println("{}", r1);
+            return {};
+        }),
+        then(CURL_sender_get(curl_async, "localhost:5001/file2.txt")
+            , [](std::string r2) -> void_t
+        {
+            std::println("{}", r2);
+            return {};
+        })
+        );
+}
+
+auto App_SendersV1(CURL_Async curl_async)
+{
+    return then(
+        when_all(
+              CURL_sender_get(curl_async, "localhost:5001/file1.txt")
+            , CURL_sender_get(curl_async, "localhost:5001/file2.txt")
+            )
+        , [](auto vs) -> void_t
+        {
+            auto [r1, r2] = vs;
+            std::println("{}", r1);
+            std::println("{}", r2);
+            return void_t{};
+        });
+}
+
+struct AnyReceiver
+{
+    template<typename T>
+    void set_value(T&&...) noexcept { finish(); }
+    template<typename E>
+    void set_error(E&&) noexcept    { finish(); }
+    void set_stopped() noexcept     { finish(); }
+
+    void finish() noexcept
+    {
+        assert(_done);
+        assert(*_done == false);
+        *_done = true;
+    }
+
+    bool* _done = nullptr;
+};
+
 int main()
 {
-    auto just_log = [](const char* text)
+    CURL_Async curl_async = CURL_async_create();
+
+    bool done1 = false;
+    auto state1 = ::connect(App_SendersV0(curl_async), AnyReceiver{&done1});
+    ::start(state1);
+
+    bool done2 = false;
+    auto state2 = ::connect(App_SendersV1(curl_async), AnyReceiver{&done2});
+    ::start(state2);
+
+    while ((done1 == false)
+        || (done2 == false))
     {
-        return then(async(), [text](void_t) -> void_t
-        {
-            std::println("{}", text);
-            return {};
-        });
-    };
-    sync_wait(sequence(
-          just_log("one")
-        , just_log("two")
-        , just_error(void_t{})
-        , just_log("three"))
-        );
+        CURL_async_tick(curl_async);
+    }
+    CURL_async_destroy(curl_async);
 }
