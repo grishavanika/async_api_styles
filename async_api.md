@@ -730,18 +730,119 @@ If [python HTTP server](#serve) is running, our program should print:
 Fox
 ```
 
-## on error handling {#error_handling .unlisted .unnumbered}
+## on error handling {#error_handling}
 
-### assume success always (tooling) {.unlisted .unnumbered}
-### implicit, return empty string {.unlisted .unnumbered}
-### status code, out parameter (std::filesystem-style) {.unlisted .unnumbered}
-### optional {.unlisted .unnumbered}
-### exceptions {.unlisted .unnumbered}
-### result/variant-like {.unlisted .unnumbered}
-### result/tuple-like {.unlisted .unnumbered}
-### result/specialized {.unlisted .unnumbered}
+[TBD?]{.mark}.
 
-# async with statefull/implicit callback (state.on_X.subscribe/delegates) {.unlisted .unnumbered}
+We assume CURL get, or, more generally, asynchronous operation never fails.
+
+This simplifies everything, especially the moment when there are several
+(asynchronous) operations active and all of them could fail or success.
+
+In addition to errors, there is cancellation. Cancellation of asynchronous
+operation adds another layer of complexity.
+
+Recent std::execution (Senders/Receivers) is explicit about those 3 possibilities
+and assumes an operation could either success, fail or be cancelled.
+
+Cancellations is (or usually) also asynchronous. You start an operation,
+you cancel it, but underlying machinery (a) may or may not support cancellation OR
+(b) it may or may not be too late. On cancel, you may have:
+
+ - an operation that actually completed successfully;
+   because it was cancelled too late or cancellation is not supported;
+ - an operation that errors out because it was cancelled in time, no side effect
+ - an operation with PARTIAL results already done
+ - (note: should partial results be considered success or error or discarded?)
+
+This asynchronous nature of cancellation is especially important in the code
+with callbacks that may arrive after cancellation that assumed to be immediate.
+
+With only two asynchronous operations run concurrently
+and 3 possible outcomes per operation, there is already 9 states to think about:
+
+ 1. {success, success}
+ 2. {success, error}
+ 3. {success, cancel}
+ 4. {error, success}
+ 5. {error, error}
+ 6. {error, cancel}
+ 7. {cancel, success}
+ 8. {cancel, error}
+ 9. {cancel, cancel}
+
+Some domains threat cancel as an error. (however, see
+["Cancellation is not an Error"](http://wg21.link/p1677)).
+That reduces the possible states to only four:
+
+ 1. {success, success}
+ 2. {success, error}
+ 4. {error, success}
+ 5. {error, error}
+
+STILL, talking about APIs, how do we represent those states?
+
+With just {success, error}, possibilities are:
+
+ - assume success always: fine for tools?
+ ```
+   > std::string CURL_get(...);
+ ```
+ - implicit, return empty "success" value. Fine for tools? Usually error prone
+ ```
+   > std::string CURL_get(...);
+ ```
+ - encode the error with the same type as success. Examples - POSIX, Win32 API
+ ```
+   > int open(const char* path);
+ ```
+ - separate status code (with out parameter?)
+ ```
+   > bool exists(const path& p, std::error_code& ec)
+ ```
+ - optional: error is signaled, but details are ignored
+ ```
+   > std::optional<std::string> CURL_get(...);
+ ```
+ - exceptions
+ ```
+   > std::string CURL_get(...);
+ ```
+ - union like/variant/result return
+ ```
+   > std::expected<std::string, std::error_code> CURL_get(...)
+ ```
+
+Talking about errors and composition, another dimension - usually missed - is error
+TYPE. How do we compose 2 operations that can fail on its own?
+
+Lets imagine we need to first open a file, then post it to our service:
+
+``` cpp {.numberLines}
+std::expected<File, std::error_code> open_file(path f);
+std::expected<void, OnlineError> post(content);
+```
+
+What should we return?
+
+``` cpp {.numberLines}
+std::expected<void, ???> process_file(path f)
+{
+    auto x = open_file(f);
+    if (x.has_error())
+    {
+        return x.error(); // std::error_code
+    }
+    auto y = post(read_file(x.value()));
+    if (y.has_error())
+    {
+        return y.error(); // OnlineError
+    }
+}
+```
+
+See, we need to combine std::error_code and OnlineError together. Usually, errors
+need to be convertible between each other and one type of error is used at the end.
 
 # building C++20 coroutines API {#coro_api}
 
@@ -1165,7 +1266,8 @@ after co_await
 ```
 
 Now, on suspend, we did nothing, but immediately resumed coroutine.
-But we also could start an async operation and, on finish, resume the coroutine.
+But we also could start an asynchronous operation and, on finish,
+resume the coroutine.
 
 ## C++ coroutines, await callback with a crash
 
@@ -2251,8 +2353,6 @@ Co_Task<void> coro_main(CURL_Async curl_async)
 For the rest of the sample code, we'll go using `CO_await_all()` version.
 
 # coroutines on top polling tasks {.unlisted .unnumbered}
-
-# building Fibers API {#fibers_api}
 
 [source code](https://github.com/grishavanika/async_api_styles/tree/main/CH060_fiber_basic),
 [sample app](#app_fibers).
@@ -4825,7 +4925,7 @@ void CURL_Get_State::start() noexcept
 Once CURL_async_get() callback is invoked, we simply invoke the receiver and pass
 the retrieved response as a result.
 
-One more time, full CURL async get sender implementation is:
+One more time, full CURL get sender implementation is:
 
 ``` cpp {.numberLines}
 template<typename Receiver>
@@ -5290,7 +5390,7 @@ sync_wait(then(just(3)
 }));
 ```
 
-Finally, to show some async work, lets implement simple `async()` sender that
+Finally, to show some asynchronous work, lets implement simple `async()` sender that
 completes the work on thread pool (using std::async):
 
 ``` cpp {.numberLines}
